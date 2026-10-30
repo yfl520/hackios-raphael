@@ -1,0 +1,107 @@
+--- a/ath10k/mac.c
++++ b/ath10k/mac.c
+@@ -9869,6 +9869,7 @@
+ #define WRD_METHOD "WRDD"
+ #define WRDD_WIFI  (0x07)
+ 
++#if IS_ENABLED(CONFIG_ACPI)
+ static u32 ath10k_mac_wrdd_get_mcc(struct ath10k *ar, union acpi_object *wrdd)
+ {
+ 	union acpi_object *mcc_pkg;
+@@ -9951,6 +9952,13 @@
+ 	*rd |= COUNTRY_ERD_FLAG;
+ 	return 0;
+ }
++
++#else
++static int ath10k_mac_get_wrdd_regulatory(struct ath10k *ar, u16 *rd)
++{
++	return -EOPNOTSUPP;
++}
++#endif
+ 
+ static int ath10k_mac_init_rd(struct ath10k *ar)
+ {
+--- a/ath10k/qmi.c
++++ b/ath10k/qmi.c
+@@ -815,6 +815,7 @@
+ 		return;
+ 
+ 	if (qmi->fw_ready) {
++		if (ath10k_qmi_cap_send_sync_msg(qmi)) return;
+ 		ath10k_snoc_fw_indication(ar, ATH10K_QMI_EVENT_FW_READY_IND);
+ 		return;
+ 	}
+@@ -861,6 +862,13 @@
+ 	ar->id.qmi_chip_id = qmi->chip_info.chip_id;
+ 	ar->hw_params.fw.dir = WCN3990_HW_1_0_FW_DIR;
+ 
++#ifdef __FreeBSD__
++	/* Native F11 CN/GL data is validated only for the default board ID. */
++	if (qmi->board_info.board_id != 0xff) {
++		ath10k_err(ar, "native F11 BDF refused for board id %#x\n", qmi->board_info.board_id);
++		return -EINVAL;
++	}
++#endif
+ 	ret = ath10k_core_check_dt(ar);
+ 	if (ret)
+ 		ath10k_dbg(ar, ATH10K_DBG_QMI, "DT bdf variant name not set.\n");
+--- a/ath10k/snoc.c
++++ b/ath10k/snoc.c
+@@ -1366,3 +1366,7 @@
++#ifdef __FreeBSD__
++extern void lx_os_radio_firmware_state(int ready);
++#endif
++
+ int ath10k_snoc_fw_indication(struct ath10k *ar, u64 type)
+ {
+ 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
+@@ -1375,5 +1379,8 @@
+ 	switch (type) {
+ 	case ATH10K_QMI_EVENT_FW_READY_IND:
++#ifdef __FreeBSD__
++		lx_os_radio_firmware_state(1);
++#endif
+ 		if (test_bit(ATH10K_SNOC_FLAG_REGISTERED, &ar_snoc->flags)) {
+ 			ath10k_core_start_recovery(ar);
+ 			break;
+@@ -1391,5 +1398,8 @@
+ 		break;
+ 	case ATH10K_QMI_EVENT_FW_DOWN_IND:
++#ifdef __FreeBSD__
++		lx_os_radio_firmware_state(0);
++#endif
+ 		set_bit(ATH10K_SNOC_FLAG_RECOVERY, &ar_snoc->flags);
+ 		set_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags);
+ 		break;
+@@ -1608,6 +1608,21 @@
+ 	return 0;
+ }
+ 
++#ifdef __FreeBSD__
++/* SM8150 has no wifi-firmware child; TrustZone owns firmware memory. */
++static int ath10k_fw_init(struct ath10k *ar)
++{
++ struct ath10k_snoc *snoc = ath10k_snoc_priv(ar);
++ struct device_node *child = of_get_child_by_name(ar->dev->of_node, "wifi-firmware");
++ if (child) { of_node_put(child); return -EOPNOTSUPP; }
++ snoc->use_tz = true;
++ return 0;
++}
++static int ath10k_fw_deinit(struct ath10k *ar)
++{
++ return ath10k_snoc_priv(ar)->use_tz ? 0 : -EOPNOTSUPP;
++}
++#else
+ static int ath10k_fw_init(struct ath10k *ar)
+ {
+ 	struct ath10k_snoc *ar_snoc = ath10k_snoc_priv(ar);
+@@ -1712,6 +1727,8 @@
+ 
+ 	return 0;
+ }
++
++#endif
+ 
+ static const struct of_device_id ath10k_snoc_dt_match[] = {
+ 	{ .compatible = "qcom,wcn3990-wifi",

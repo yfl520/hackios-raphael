@@ -1,0 +1,26 @@
+HakiOS / Redmi K20 Pro source
+
+This tree is based on HeliumStudio-Dev/hackios-xnu-kernel. Original
+copyright and license notices are retained. See THIRD_PARTY_LICENSES.md.
+
+Included:
+- kernel/: selected Apple XNU 8796.121.2 sources and HakiOS adaptations.
+  Apple's APSL 2.0 and individual third-party file notices apply.
+- kernel/bsd/miscfs/apfs/libdeflate/: Eric Biggers / Google, MIT; see COPYING.
+- kernel/bsd/miscfs/apfs/libzbitmap/ and tools/lzbitmap/: Corellium LLC,
+  libzbitmap decompression, used under the offered MIT option; see COPYING.
+- xnu-deps/hostinc/: Apple open-source Mach-O headers; retained file notices.
+- wifi/lx/ and tools/mesa/: compatibility layers, patches and build tools;
+  retain individual notices. Downloaded dependencies keep their own licenses.
+
+Bluetooth source provenance:
+- kernel/bsd/dev/hakios.raphael-bt.c adapts vayu_bt.c from
+  nomorecoolnicknames/hakios-sm8150 at
+  3e7be137a100cef19f1d7e83346b6e688be697d1. No license grant was found in
+  that source repository or file. Its presence here does not grant a new
+  license to the upstream author's work. The root project license does not
+  assign MIT or APSL terms to this component by assumption.
+
+Not included: Apple system images or SDKs, fonts, device firmware, firmware
+arrays, private NV/calibration, third-party IPA files, device logs or identity.
+The generated RMTFS scratch reservation contains zeroes, not device data.
