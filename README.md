@@ -1,5 +1,7 @@
 # HakiOS · Raphael
 
+[简体中文](README.md) · [English](README.en.md)
+
 Redmi K20 Pro／K20 Pro 尊享版（SM8150 系列、Adreno 640）的 iOS 16.5／XNU 实验移植，包含内核、驱动、引导加载器、用户态和双系统安装工具。
 
 [文档](docs/README.md) · [设备与功能支持](devices/raphael/README.md) · [安装说明](docs/getting-started/phone.md) · [构建方法](docs/BUILD.md)

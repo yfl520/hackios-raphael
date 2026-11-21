@@ -1,5 +1,7 @@
 # Redmi K20 Pro／K20 Pro 尊享版
 
+[简体中文](README.md) · [English](README.en.md)
+
 | 项目 | 配置 |
 | --- | --- |
 | 设备代号 | `raphael` |

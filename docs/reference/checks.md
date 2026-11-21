@@ -1,5 +1,7 @@
 # 验证方法
 
+[简体中文](checks.md) · [English](checks.en.md)
+
 以下检查从 Linux 源码根目录执行，不连接手机：
 
 ```bash

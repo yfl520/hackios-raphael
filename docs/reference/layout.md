@@ -1,5 +1,7 @@
 # 仓库结构
 
+[简体中文](layout.md) · [English](layout.en.md)
+
 | 路径 | 内容 |
 | --- | --- |
 | `devices/` | 设备入口、硬件配置与功能支持情况 |
@@ -32,7 +34,7 @@ Linux 源码根目录执行 `make` 或 `make help` 查看入口。原有 `script
 | `make cellular` | 构建蜂窝用户态兼容库 |
 | `make persistence` | 构建独立持久化 init |
 | `make verify` | 检查完整组件产物 |
-| `make test` | 运行主机、蜂窝及安装器测试 |
+| `make test` | 运行主机、蜂窝、安装器及产物检查器测试 |
 | `make audit` | 扫描公开源码，报告放在忽略的 `build/` 下 |
 
 环境、SDK、固件与镜像要求见 [构建方法](../BUILD.md)。`make` 不负责自动准备完整手机镜像，不会连接或刷写手机。

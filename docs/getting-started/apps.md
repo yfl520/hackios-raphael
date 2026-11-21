@@ -1,5 +1,7 @@
 # 应用安装
 
+[简体中文](apps.md) · [English](apps.en.md)
+
 ## 巨魔安装
 
 先按 [完整包使用说明](../../installer/使用说明.md) 安装并打开 TrollStore。Safari 分享和本地文件导入尚未修复，可使用巨魔的「通过 URL 安装」。

@@ -1,5 +1,7 @@
 # 贡献说明
 
+[简体中文](CONTRIBUTING.md) · [English](CONTRIBUTING.en.md)
+
 ## 修改位置
 
 直接修改 `kernel/` 中的集成内核，不运行 `xnu/apply.sh` 覆盖它。组件职责见[仓库结构](docs/reference/layout.md)，构建环境见[构建方法](docs/BUILD.md)。设备的功能状态统一维护在 [devices/raphael/README.md](devices/raphael/README.md)。

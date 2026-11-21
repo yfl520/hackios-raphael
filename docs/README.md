@@ -1,5 +1,7 @@
 # 文档
 
+[简体中文](README.md) · [English](README.en.md)
+
 ## 使用
 
 | 内容 | 入口 |

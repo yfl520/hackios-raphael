@@ -1,5 +1,7 @@
 # Windows 安装器源码
 
+[简体中文](README.md) · [English](README.en.md)
+
 支持静态／动态分区识别、自选 iOS 容量、从本机 root recovery 读取无线 NV、局域网 IPA URL 服务及安装会话续装。
 
 本目录是源码，不是可直接刷入的完整安装包。镜像、Python 运行时、ADB/FASTBOOT、TWRP、应用和发行文件清单未包含。不要直接将源码脚本覆盖到任意旧整包：`config.json` 中的大小、资源几何、SHA-256 和模块必须与重新组装的产物一致；完整包还需要生成 `manifest.json`。

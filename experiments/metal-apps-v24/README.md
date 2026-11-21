@@ -1,5 +1,7 @@
 # Raphael 应用 Metal／GLES 实验 · V24
 
+[简体中文](README.md) · [English](README.en.md)
+
 本目录保存应用限定 Metal 实验源码。iOS 16.5、Adreno 640；仅向原版抖音 `Aweme`、B 站 `bili-overseas` 和测试探针开放设备，桌面保留 CPU／NEON 合成。没有修改第三方 IPA，也不通过替换播放器或伪造绘制成功修复视频。
 
 ## 功能状态

@@ -1,5 +1,7 @@
 # 构建方法
 
+[简体中文](BUILD.md) · [English](BUILD.en.md)
+
 [文档目录](README.md) · [设备支持](../devices/raphael/README.md) · [命令速查](reference/layout.md#构建入口)
 
 可用 `make help` 查看统一入口，下面同时保留直接调用脚本的方法。

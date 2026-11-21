@@ -1,5 +1,7 @@
 # 设备
 
+[简体中文](README.md) · [English](README.en.md)
+
 | 设备 | 代号 | 平台 | 系统 |
 | --- | --- | --- | --- |
 | [Redmi K20 Pro／K20 Pro 尊享版](raphael/README.md) | `raphael` | SM8150 系列、Adreno 640 | iOS 16.5 |

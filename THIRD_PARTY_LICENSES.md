@@ -32,22 +32,23 @@ and the root project license do not grant new rights to that upstream work.
 | iOS firmware / system files | `sysimage/`, `xnuloader/mkidentity.sh` | Apple proprietary terms; user supplies authorized copies, not included |
 | GPU, Wi-Fi, DSP, Bluetooth and other device firmware | local image assembly inputs | Vendor terms; obtain from the user's own matching device, not included |
 
-This source-only tree has no `prebuilt/` or `devices/` directory and does not
-ship UEFI firmware, touchscreen firmware arrays, images or SDKs. Build-time
+This source-only tree has no `prebuilt/` directory. `devices/` contains documentation,
+not device firmware. The repository does not ship UEFI firmware, touchscreen
+firmware arrays, images or SDKs. Build-time
 downloads do not imply that their binaries may be redistributed as a bundle.
 
-## 其他组件许可
+## Additional component licenses
 
-| 内容 | 来源及许可 |
+| Component | Origin and terms |
 | --- | --- |
-| HFS 数据卷 | Apple `hfs-627.100.6`，`kernel/bsd/hfs/`、`kernel/bsd/hfs_encodings/`；APSL 2.0 和文件内原始声明，参见 [Apple HFS](https://github.com/apple-oss-distributions/hfs/tree/hfs-627.100.6) |
-| 蜂窝桥接／PDP／QMI | chiba233/Trogdor-ipadOS 与 UniXNU/QcomBaseband 的接口实现；coachz 文件保留 BSD-2-Clause SPDX，板级改动仍受各文件声明约束 |
-| Metal 前端与桥接 | UniXNU/AdrenoMetal `73d582fd4d5772b1f5fa83581a25077a16f2b6cd`；MIT 声明和 LICENSE 保留于实验目录 |
-| 同 GPU 的 iOS16 参考 | NWylynko/ios-flame `745c4341af86089efb0df851fa8a27fb8face624`；引用／移植部分保留 `LICENSE-ios-flame`，MIT |
-| AIR／Vulkan runtime | steelbrain/metal2vulkan `555b13d57e09bff70996a88cff64f1275256d5cf`；GPL-2.0-or-later OR LGPL-3.0-or-later；完整上游源码由固定归档准备，本机补丁单独保存。静态链接发行时须继续满足所选许可的源代码／重新链接要求，不能仅附 MIT 前端源码 |
-| H.264 编码依赖 | x264，未包含其源码／二进制；构建录屏适配时自行准备，遵守其 GPL 或另行取得的商业许可 |
-| 图像写入 | `components/offline-features/stb_image_write.h`，文件内 MIT／public-domain 双选声明保留 |
-| Android AVB 工具 | `installer/tools/avbtool.py`，Android Open Source Project，Apache-2.0 文件声明保留 |
-| 分区生成脚本 | `installer/tools/userdata-carve.py`，HeliumStudio-Dev/hackios-xnu-kernel，原始文件和发行许可证保留；输入提交见 `installer/config.json` |
+| HFS data volumes | Apple `hfs-627.100.6`, in `kernel/bsd/hfs/` and `kernel/bsd/hfs_encodings/`; APSL 2.0 and original file notices; see [Apple HFS](https://github.com/apple-oss-distributions/hfs/tree/hfs-627.100.6) |
+| Cellular bridge / PDP / QMI | Interface implementations from chiba233/Trogdor-ipadOS and UniXNU/QcomBaseband; coachz files retain BSD-2-Clause SPDX notices, and board adaptations remain subject to individual file terms |
+| Metal frontend and bridge | UniXNU/AdrenoMetal `73d582fd4d5772b1f5fa83581a25077a16f2b6cd`; MIT notices and LICENSE retained in the experiment directory |
+| Same-GPU iOS 16 reference | NWylynko/ios-flame `745c4341af86089efb0df851fa8a27fb8face624`; referenced/adapted parts retain the MIT `LICENSE-ios-flame` |
+| AIR / Vulkan runtime | steelbrain/metal2vulkan `555b13d57e09bff70996a88cff64f1275256d5cf`; GPL-2.0-or-later OR LGPL-3.0-or-later. Complete upstream source is prepared from the pinned archive and local changes are distributed separately. Static distributions must continue to satisfy the selected license's source/relinking requirements; including only the MIT frontend source is insufficient |
+| H.264 encoding dependency | x264; its source/binaries are not included. Provide it when building recording adapters and comply with its GPL or separately obtained commercial license |
+| Image writing | `components/offline-features/stb_image_write.h`; original MIT / public-domain alternatives retained in the file |
+| Android AVB tool | `installer/tools/avbtool.py`, Android Open Source Project; Apache-2.0 file notices retained |
+| Partition generator | `installer/tools/userdata-carve.py`, HeliumStudio-Dev/hackios-xnu-kernel; original file and distribution license retained; input commit recorded in `installer/config.json` |
 
-本次发布为源码更新，不包含 Apple 原始指令镜像、shader 二进制、第三方应用或设备私有固件。CommCenter 兼容库中用于匹配的短指令守卫不会放宽 UUID／映射范围／失败回滚条件。
+This source distribution does not include original Apple executable images, shader binaries, third-party applications, or private device firmware. The short instruction guards used for CommCenter matching do not relax UUID, mapped-range, or failure-rollback checks.
