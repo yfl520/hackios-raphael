@@ -12,6 +12,7 @@
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
  */
 #include <kern/clock.h>
+#include "raphael-power-policy.h"
 #include <kern/thread.h>
 #include <kern/simple_lock.h>
 #include <os/atomic_private.h>
@@ -92,6 +93,7 @@ static const uint32_t osm_phys[3] = { 0x18323000, 0x18325800, 0x18327800 };
 static vm_offset_t osm_base[3];
 static uint32_t osm_saved[3], osm_low[3], osm_high[3], osm_row[3], osm_khz[3][40];
 static bool osm_stopping;
+static bool osm_power_policy, osm_valid[3][40];
 static simple_lock_data_t osm_lock;
 static uint64_t osm_boost_until;
 
@@ -187,6 +189,13 @@ osm_governor(void *arg __unused, wait_result_t wr __unused)
 			quiet[d] = busy[d] < 20 ? quiet[d] + 1 : 0;
 			/* shortcut: active/idle OSM levels; refine only after measuring power and latency. */
 			wanted = samples < 40 || now < osm_boost_until || quiet[d] < 4 ? osm_high[d] : osm_low[d];
+            if (osm_power_policy) {
+                wanted = raphael_cpu_row(osm_khz[d], osm_valid[d], osm_low[d], osm_high[d],
+                    osm_row[d], busy[d], samples < 40 || now < osm_boost_until);
+                /* Rise immediately; avoid frequency oscillation on transient idle gaps. */
+                if (osm_khz[d][wanted] < osm_khz[d][osm_row[d]] && quiet[d] < 4 && busy[d] < 20)
+                    wanted = osm_row[d];
+            }
 			if (wanted != osm_row[d]) {
 				*(volatile uint32_t *)(osm_base[d] + 0x920) = wanted;
 				__asm__ volatile ("dsb sy" ::: "memory");
@@ -217,6 +226,9 @@ osm_start(void)
 	unsigned owned[3] = { 0 };
 
 	PE_parse_boot_argn("cpufreq", &mode, sizeof(mode));
+    uint32_t policy = 0;
+    osm_power_policy = PE_parse_boot_argn("power_policy", &policy, sizeof(policy)) && policy == 1;
+    if (osm_power_policy) tell("cpufreq: load-scaled firmware LUT policy, touch boost retained\n");
 	simple_lock_init(&osm_lock, 0);
 	for (unsigned i = 0; i < topology->num_cpus; i++) {
 		owned[domain_of(topology->cpus[i].phys_id)]++;
@@ -255,7 +267,11 @@ osm_start(void)
 				    osm_khz[d][osm_low[d]] / 1000, owned[d], domain_cpus[d]);
 			}
 		}
-		osm_base[d] = base;
+		for (unsigned row = 0; row < 40; row++) {
+            osm_valid[d][row] = ((words[row] >> 16) & 7) == 4 &&
+                osm_khz[d][row] >= osm_khz[d][osm_low[d]] && osm_khz[d][row] <= osm_khz[d][osm_high[d]];
+        }
+        osm_base[d] = base;
 		osm_saved[d] = *(volatile uint32_t *)(base + 0x920);
 		osm_row[d] = osm_high[d];
 		*(volatile uint32_t *)(base + 0x920) = osm_row[d];

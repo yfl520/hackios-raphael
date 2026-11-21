@@ -229,6 +229,8 @@ say_line(const char *line, bool aloud)
 	}
 	lck_mtx_lock(&say_lock);
 	if (quiet && !aloud) {
+        /* V5 startup diagnosis: host log only; no framebuffer text. */
+        for(const char *c=line;*c;c++)loader_log_putc(*c);
 		for (const char *c = line; *c != 0; c++) {
 			kept[kept_at] = *c;
 			if (++kept_at == sizeof(kept)) {
@@ -1245,6 +1247,7 @@ raphael_camera_rpmh_reference(void)
 
 /* Native pil_modem proxy votes: CX/MSS TURBO and the crystal oscillator. */
 static bool audio_proxy_active;
+static bool mpss_proxy_held, mpss_proxy_release_tried;
 
 static bool
 mpss_proxy(void)
@@ -1278,8 +1281,35 @@ mpss_proxy(void)
 		if (!found) { printf("wifi: MPSS has no TURBO position for %s\n", names[i]); return false; }
 		printf("wifi: MPSS proxy %s: address %#x, vote %u\n", names[i], addresses[i], values[i]);
 	}
-	/* shortcut: keep shared CX/XO proxy votes until reboot; replace with aggregated votes for normal Wi-Fi use. */
-	return wifi_rpmh_write(addresses, values, 3);
+	/* Shared CX/XO retain their existing sticky ownership policy. */
+	bool ok = wifi_rpmh_write(addresses, values, 3);
+	if (ok) { mpss_proxy_held = true; mpss_proxy_release_tried = false; }
+	return ok;
+}
+
+/* Android PIL relinquishes boot proxy votes on the modem's proxy-unvote IRQ.
+ * This controlled trial relinquishes only the dedicated MSS vote. Shared
+ * CX/XO remain owned by the existing sticky audio/Wi-Fi policy. */
+extern void hakios_tl(const char *format, ...);
+static void __attribute__((noinline))
+mpss_proxy_handover(uint32_t state)
+{
+    if (!hakios_is_raphael() || hakios_wifi_option("raphael_native_bb") != 1 ||
+        !mpss_proxy_held || mpss_proxy_release_tried || (state & DSP_FATAL) ||
+        !(state & DSP_READY) || !(state & DSP_HANDOVER)) return;
+    mpss_proxy_release_tried = true;
+    uint32_t address = 0, before = 0, off = 0;
+    bool ok = false;
+    lck_mtx_lock(&rpmh_lock);
+    const struct cmd_db_entry *entry = rpmh_resource("mss.lvl", 0);
+    if (rsc.base && entry && ((entry->address >> 16) & 0xf) == 3) {
+        address = entry->address;
+        if (raphael_rpmh_read_locked(address, &before))
+            ok = wifi_rpmh_write_unlocked(&address, &off, 1);
+    }
+    if (ok) mpss_proxy_held = false;
+    lck_mtx_unlock(&rpmh_lock);
+    ((void)0);
 }
 
 /* Audio shares CX and XO with MPSS. Keep the existing sticky proxy policy:
@@ -1892,8 +1922,12 @@ dsp_load_state(bool on)
 static void glink_reset(void);
 static bool glink_prepare(void);
 static bool mpss_storage_prepare(void);
+static void tftp_expire(void);
 static void link_stop(void);
 
+static bool ripa_data_opted_in(void);
+static bool ripa_data_clock_available(void);
+static void ripa_data_tick(void);
 static uint32_t our_item;               /* where our SMP2P item is in the area; 0: not looked for, or not there */
 static bool smp2p_agreed;               /* the DSP's item and ours have the same version: what follows applies */
 static bool smp2p_restart_acks;         /* ... and both sides have the feature */
@@ -1934,6 +1968,14 @@ dsp_listen(const struct smp2p *theirs)
 		smp2p_agreed = true;
 		printf("wifi: %u: the DSP and we agree on SMP2P: version %u, features %#x\n", step, ours.version & 0xff, features);
 	}
+	mpss_proxy_handover(dsp_state(theirs));
+    if(hakios_is_raphael() && ripa_data_clock_available()) {
+        int in=smp2p_entry(theirs,"ipa"),out=smp2p_entry(&ours,"ipa");
+        if(in>=0 && out>=0 && (theirs->entry[in].value&1) && ours.entry[out].value!=3) {
+            smem_poke(our_item+SMP2P_AT_VALUE(out),3);settle();
+            ring(IPCC_WPSS,IPCC_SMP2P,"IPA clock query");
+        }
+    }
 	if (smp2p_restart_acks && ((theirs->flags & SMP2P_RESTART_DONE) != 0) != smp2p_restart_acked) {
 		smp2p_restart_acked = !smp2p_restart_acked;
 		printf("wifi: %u: the DSP's flags say it has restarted (%#x): about to answer in our flags at %#lx (bit 1 = %u) and ring "
@@ -2067,6 +2109,9 @@ static void radio_space_off(void);
 static void mpss_storage_stop(void);
 static void icnss_memory_stop(void);
 
+static bool raphael_ipa_preboot_stop(void);
+static void ripa_qmi_stop(void);
+
 static bool
 dsp_shutdown(const char *why)
 {
@@ -2078,6 +2123,7 @@ dsp_shutdown(const char *why)
 	if (!leaving) {
 		hakios_lx_stop();                      /* (the driver, if it stayed up: it leaves its network and goes down in order) */
 		hakios_wlfw_stop(step);                /* (what the stand-in of step 15 has to say first, while there is a link) */
+		ripa_qmi_stop();
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
@@ -2090,6 +2136,7 @@ dsp_shutdown(const char *why)
 	if (hakios_is_raphael()) { icnss_memory_stop(); mpss_storage_stop(); }
 	if (!hakios_is_raphael()) wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
 	doorbells();
+	if (!raphael_ipa_preboot_stop()) return false;
 	dsp_started = false;
 	dsp_load_state(false);
 	/*
@@ -2344,11 +2391,15 @@ out:
 	return made;
 }
 
+#include "hakios.raphael-ipa-boot.h"
+
 static bool
 step_our_item(void)
 {
-	static const char *const names[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
-	uint32_t count = hakios_is_raphael() ? 1 : sizeof(names) / sizeof(names[0]);
+	static const char *const normal[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
+	static const char *const raphael[] = { OUR_ENTRY_STOP, "ipa" };
+	const char *const *names=hakios_is_raphael()?raphael:normal;
+	uint32_t count=hakios_is_raphael()?(ripa_data_opted_in()?2:1):2;
 	struct smem_partition header;
 	struct smp2p ours;
 	uint32_t cacheline = 0, size = 0, partition;
@@ -2413,7 +2464,10 @@ step_our_item(void)
 	announce("see that our two marks in GLINK's descriptor are at zero before the DSP starts");
 	if (hakios_is_raphael() && !glink_prepare()) return false;
 	glink_reset();
+	((void)0);
 	if (hakios_is_raphael() && last_step >= 14 && hakios_wifi_option("wifi_ask") && !mpss_storage_prepare()) return false;
+	/* Firmware failure leaves RF disabled; the verified Wi-Fi/USIM path may still start. */
+	if (!raphael_ipa_preboot()) printf("raphael-ipa: preboot failed; retaining SIM-only operation\n");
 	return true;
 }
 
@@ -2625,7 +2679,24 @@ static struct {
 	uint32_t our_intent_count;
 	struct glink_packet *first, *last;      /* received, in order */
 	uint32_t said, heard, trace;            /* messages each way; how many more are written to the log */
+    uint32_t data_in, done_in, intent_req_in, intent_ack_in, control_failed;
+    uint64_t last_rx_us;
+    struct rbb_glink_header {
+        uint32_t time_ms, direction;
+        struct glink_message header;
+    } headers[64];
+    uint32_t header_count, request_size, request_channel, request_granted_last;
+    uint32_t request_elapsed_us, request_time_ms;
 } glink;
+
+/* Metadata only: no bytes after the GLINK header are stored. glink_lock held. */
+static void rbb_glink_header_record(unsigned direction, const struct glink_message *header)
+{
+    unsigned slot=glink.header_count++ % 64u;
+    glink.headers[slot].time_ms=(uint32_t)(now_us()/1000u);
+    glink.headers[slot].direction=direction;
+    glink.headers[slot].header=*header;
+}
 
 static uint32_t
 smem_word(uint32_t offset)
@@ -2714,6 +2785,11 @@ glink_peek(void *to, uint32_t offset, uint32_t count)
 {
 	uint32_t at = (smem_word(glink.descriptor + GLINK_THEIR_TAIL) + offset) % glink.theirs_size;
 
+	/* Pair the remote's published head with the following shared FIFO loads.
+	 * Plain volatile loads/compiler clobbers do not order ARM64 reads.
+	 * Same placement as Linux glink_smem_rx_peek() rmb(); use the
+	 * full-system ARM64 read barrier for memory shared with MPSS. */
+	__asm__ volatile ("dsb ld" : : : "memory");
 	for (uint32_t i = 0; i < count; i++) {
 		((uint8_t *)to)[i] = smem[glink.theirs + (at + i) % glink.theirs_size];
 	}
@@ -2758,6 +2834,11 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	ring(IPCC_WPSS, IPCC_GLINK, "the DSP's GLINK doorbell");
 	glink.said++;
+    if (first_length>=sizeof(struct glink_message)) {
+        struct glink_message metadata;
+        memcpy(&metadata,first,sizeof(metadata));
+        rbb_glink_header_record(1,&metadata);
+    }
 	return true;
 }
 
@@ -2778,6 +2859,7 @@ glink_say(unsigned command, uint32_t param1, uint32_t param2, const void *more, 
 {
 	struct glink_message message = { .command = (uint16_t)command, .param1 = (uint16_t)param1, .param2 = param2 };
 	bool sent = glink_put(&message, sizeof(message), more, more_length);
+    if (!sent) ++glink.control_failed;
 
 	if (glink.trace > 0 || !sent) {
 		glink.trace -= glink.trace > 0;
@@ -2852,6 +2934,8 @@ glink_pump(void)
 			return;                                 /* (the rest of it is on its way) */
 		}
 		glink.heard++;
+        glink.last_rx_us=now_us();
+        rbb_glink_header_record(0,&message);
 		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE) {
 			glink.trace--;
 			printf("wifi: glink: < %s %u %#x\n", glink_name(message.command), message.param1, message.param2);
@@ -2919,6 +3003,7 @@ glink_pump(void)
 			break;
 		case GLINK_DONE:
 		case GLINK_DONE_REUSE:
+            ++glink.done_in;
 			for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
 				if (glink.their_intents[n].there && glink.their_intents[n].id == message.param2) {
 					glink.their_intents[n].in_use = false;
@@ -2928,20 +3013,29 @@ glink_pump(void)
 			glink_advance(length);
 			break;
 		case GLINK_INTENT_REQUEST:
+            ++glink.intent_req_in;
 			glink_advance(length);
 			if (message.param1 == glink.their_channel) {
+                const uint64_t request_start=now_us();
 				bool granted = glink_offer(message.param2);
+                glink.request_size=message.param2;
+                glink.request_channel=message.param1;
+                glink.request_granted_last=granted;
+                glink.request_elapsed_us=(uint32_t)(now_us()-request_start);
+                glink.request_time_ms=(uint32_t)(request_start/1000u);
 
 				glink_say(GLINK_INTENT_REQUEST_ACK, GLINK_US, granted, NULL, 0);
 			}
 			break;
 		case GLINK_INTENT_REQUEST_ACK:
+            ++glink.intent_ack_in;
 			glink_advance(length);
 			glink.request_answered = true;
 			glink.request_granted = message.param2 != 0;
 			break;
 		case GLINK_DATA:
 		case GLINK_DATA_MORE: {
+            ++glink.data_in;
 			uint32_t intent = message.param2 - 1;
 
 			if (message.param1 != glink.their_channel || intent >= glink.our_intent_count ||
@@ -3010,13 +3104,15 @@ glink_pump(void)
 	}
 }
 
+extern void hakios_tl(const char *format, ...);
+
 /*
  * One whole message to the DSP on the channel (Linux's __qcom_glink_send(), for messages that
  * go in one piece). Waits, up to five seconds, for an intent of the DSP's that it fits and
  * for room in our queue, asking for the intent if there is none.
  */
 static int
-glink_send(const void *data, uint32_t length)
+glink_send_mode(const void *data, uint32_t length, bool wait)
 {
 	struct {
 		struct glink_message message;
@@ -3024,6 +3120,7 @@ glink_send(const void *data, uint32_t length)
 	} header = { { GLINK_DATA, GLINK_US, 0 }, length, 0 };
 	bool asked = false, fits;
 	int found = -1;
+	static uint64_t next_request_us;
 
 	lck_mtx_lock(&glink_lock);
 	if (glink.up && length + sizeof(header) + 8 > glink.ours_size - GLINK_RESERVE) {
@@ -3050,11 +3147,26 @@ glink_send(const void *data, uint32_t length)
 		if (found >= 0 && glink_room() >= ((length + sizeof(header) + 7) & ~7u)) {
 			break;
 		}
-		if (!fits && !asked) {
+		if (!asked && ((wait && !fits) ||
+            (!wait && found < 0 && now_us() >= next_request_us && glink_room() >= 8))) {
 			glink.request_answered = false;
 			glink_say(GLINK_INTENT_REQUEST, GLINK_US, length, NULL, 0);
 			asked = true;
+            if (!wait) next_request_us=now_us()+250000u;
 		}
+        if (!wait) {
+            static unsigned logged;
+            if (logged++<16) {
+                unsigned free_intents=0,busy_intents=0;
+                for (unsigned n=0;n<sizeof(glink.their_intents)/sizeof(glink.their_intents[0]);++n)
+                    if (glink.their_intents[n].there) {
+                        if (glink.their_intents[n].in_use) ++busy_intents; else ++free_intents;
+                    }
+                ((void)0);
+            }
+            lck_mtx_unlock(&glink_lock);
+            return EAGAIN;
+        }
 		if (waited >= 5000 || (!fits && asked && glink.request_answered && !glink.request_granted)) {
 			lck_mtx_unlock(&glink_lock);
 			return found < 0 ? ENOBUFS : EAGAIN;
@@ -3065,9 +3177,10 @@ glink_send(const void *data, uint32_t length)
 	}
 	glink.their_intents[found].in_use = true;
 	header.message.param2 = glink.their_intents[found].id;
-	glink_put(&header, sizeof(header), data, length);
+	const bool sent=glink_put(&header, sizeof(header), data, length);
+    if (!sent) glink.their_intents[found].in_use=false;
 	lck_mtx_unlock(&glink_lock);
-	return 0;
+	return sent ? 0 : EAGAIN;
 }
 
 /* ---- QRTR -------------------------------------------------------------------------------------------- */
@@ -3083,6 +3196,13 @@ glink_send(const void *data, uint32_t length)
  * this section, handed to the QMI helpers (bsd/dev/hakios.qmi.c), which is what speaks to the
  * services.
  */
+#include "raphael_bb_transport.h"
+extern int raphael_baseband_enabled(void);
+extern void raphael_baseband_configure(int (*send)(uint32_t,uint32_t,uint32_t,const void*,uint32_t),int (*del_client)(uint32_t));
+extern void raphael_baseband_new_server(uint32_t,uint32_t,uint32_t,uint32_t);
+extern void raphael_baseband_del_server(uint32_t,uint32_t,uint32_t);
+extern int raphael_baseband_qrtr(uint32_t,uint32_t,uint32_t,const void*,uint32_t);
+extern void raphael_baseband_poll(void);
 #define HAKIOS_QRTR_MAX        8192            /* the most a datagram holds, either way */
 #define QRTR_US                 1u
 #define QRTR_CONTROL            0xfffffffeu     /* the control port */
@@ -3123,7 +3243,7 @@ static thread_t link_thread_is;
 
 /* One datagram out, of any type. */
 static int
-qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+qrtr_out_packet_mode(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length, bool nowait)
 {
 	uint32_t padded = (length + 3) & ~3u;
 	struct qrtr_header *packet;
@@ -3144,10 +3264,16 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	error = glink_send_mode(packet, (uint32_t)sizeof(*packet) + padded, !nowait);
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
+}
+
+static int
+qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+{
+    return qrtr_out_packet_mode(type,from_port,to_node,to_port,data,length,false);
 }
 
 static bool
@@ -3161,6 +3287,10 @@ qrtr_matches(uint32_t service, uint32_t instance, unsigned server)
 static void
 qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, bool arrived)
 {
+    if(hakios_is_raphael() && raphael_baseband_enabled()) {
+        if(arrived)raphael_baseband_new_server(service,instance,node,port);
+        else raphael_baseband_del_server(service,node,port);
+    }
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
 		for (unsigned l = 0; l < 4; l++) {
 			hakios_qrtr_server_t server = NULL;
@@ -3244,6 +3374,108 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 	}
 }
 
+/* Read only existing shared records; no allocation, DIAG endpoint, doorbell,
+ * modem request, restart, or shared-memory write. Initial contents can be stale.
+ * The link owner is the only caller. Emit only to the host log, not the display. */
+static void __attribute__((noinline))
+rbb_smem_crash_report(const char *stage)
+{
+    static uint8_t bytes[4096];
+    const uint32_t items[2] = { ITEM_CRASH_REASON, 611 };
+    for (unsigned i=0; i<2; ++i) {
+        uint32_t size=0, offset=smem_item(items[i],&size);
+        uint32_t limit=i==0 ? 1024u : (uint32_t)sizeof(bytes);
+        uint32_t count=size<limit ? size : limit;
+        if (!offset || !count || (uint64_t)offset+count>SMEM_SIZE) {
+            ((void)0);
+            continue;
+        }
+        __asm__ volatile ("dsb ld" : : : "memory");
+        if (!smem_peek(offset,bytes,count)) continue;
+        unsigned nonzero=0; uint32_t hash=2166136261u;
+        for (uint32_t n=0;n<count;++n) { nonzero+=bytes[n]!=0; hash=(hash^bytes[n])*16777619u; }
+        ((void)0);
+        for (uint32_t at=0;at<count;at+=32) {
+            char text[65];uint32_t n=count-at<32 ? count-at : 32;
+            const char hex[]="0123456789abcdef";
+            for (uint32_t j=0;j<n;++j) { text[2*j]=hex[bytes[at+j]>>4];text[2*j+1]=hex[bytes[at+j]&15]; }
+            text[2*n]=0;
+            ((void)0);
+        }
+    }
+}
+
+/* Native-only read-only samples; never consume data or write shared marks here. */
+static void rbb_link_report(void)
+{
+    static uint64_t next_us;
+    static unsigned reports;
+    const uint64_t now=now_us();
+    if (reports>=720 || now<next_us) return;
+    next_us=now+5000000u; ++reports;
+    unsigned free_intents=0,busy_intents=0,tx_head=0,tx_tail=0,rx_head=0,rx_tail=0;
+    unsigned room=0,waiting=0,up,open,broken,said,heard,data,done,requests,acks,failed,age;
+    struct rbb_glink_header history[64];
+    static bool history_dumped;
+    static bool crash_initial,crash_stall_2s,crash_stall_10s;
+    unsigned history_count=0,request_size,request_channel,request_granted,request_us,request_ms;
+    struct glink_message pending={0};
+    bool pending_valid=false;
+    struct smp2p peer;
+    unsigned peer_valid=dsp_words(&peer),peer_state=0,peer_wlan=0;
+    if (peer_valid) {
+        peer_state=dsp_state(&peer);
+        int wlan=smp2p_entry(&peer,"wlan");
+        if (wlan>=0) peer_wlan=peer.entry[wlan].value;
+    }
+    lck_mtx_lock(&glink_lock);
+    up=glink.up;open=glink.open;broken=glink.broken;
+    for (unsigned n=0;n<sizeof(glink.their_intents)/sizeof(glink.their_intents[0]);++n)
+        if (glink.their_intents[n].there) {
+            if (glink.their_intents[n].in_use) ++busy_intents; else ++free_intents;
+        }
+    if (glink.up) {
+        tx_head=smem_word(glink.descriptor+GLINK_OUR_HEAD);
+        tx_tail=smem_word(glink.descriptor+GLINK_OUR_TAIL);
+        rx_head=smem_word(glink.descriptor+GLINK_THEIR_HEAD);
+        rx_tail=smem_word(glink.descriptor+GLINK_THEIR_TAIL);
+        room=glink_room();waiting=glink_waiting();
+    }
+    said=glink.said;heard=glink.heard;data=glink.data_in;done=glink.done_in;
+    requests=glink.intent_req_in;acks=glink.intent_ack_in;failed=glink.control_failed;
+    age=glink.last_rx_us ? (unsigned)((now_us()-glink.last_rx_us)/1000u) : 0xffffffffu;
+    request_size=glink.request_size;request_channel=glink.request_channel;
+    request_granted=glink.request_granted_last;request_us=glink.request_elapsed_us;request_ms=glink.request_time_ms;
+    if (!history_dumped && glink.up && age>=2000 && tx_head!=tx_tail && tx_tail<glink.ours_size) {
+        history_dumped=true;
+        unsigned total=glink.header_count;
+        history_count=total<64u ? total : 64u;
+        for (unsigned i=0;i<history_count;++i) history[i]=glink.headers[(total-history_count+i)%64u];
+        unsigned available=tx_head>=tx_tail ? tx_head-tx_tail : glink.ours_size-tx_tail+tx_head;
+        if (available>=sizeof(pending)) {
+            for (unsigned i=0;i<sizeof(pending);++i)
+                ((uint8_t *)&pending)[i]=smem[glink.ours+(tx_tail+i)%glink.ours_size];
+            pending_valid=pending.command<=GLINK_SIGNALS && pending.command!=10;
+        }
+    }
+    lck_mtx_unlock(&glink_lock);
+    if (!crash_initial && up && open) { crash_initial=true;rbb_smem_crash_report("initial"); }
+    if (up && tx_head!=tx_tail && age>=2000 && !crash_stall_2s) {
+        crash_stall_2s=true;rbb_smem_crash_report("pending-2s");
+    }
+    if (up && tx_head!=tx_tail && age>=10000 && !crash_stall_10s) {
+        crash_stall_10s=true;rbb_smem_crash_report("pending-10s");
+    }
+    ((void)0);
+    if (history_count) {
+        ((void)0);
+        for (unsigned i=0;i<history_count;++i)
+            ((void)0);
+    }
+    ((void)0);
+    ((void)0);
+}
+
 /* A message from the channel: one datagram. From the link's thread. */
 static void
 qrtr_input(const uint8_t *data, uint32_t length)
@@ -3288,7 +3520,16 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		/* the sender counts what it has sent to this port, and waits for this before it sends many more */
 		struct qrtr_control resume = { .command = QRTR_RESUME_TX, .words = { header.to_node, header.to_port } };
 
-		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
+        const uint64_t ack_start=now_us();
+        const int ack_error=qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
+        const unsigned ack_ms=(unsigned)((now_us()-ack_start)/1000u);
+        if (rbb_reserved_port(header.to_port) && hakios_is_raphael() && raphael_baseband_enabled()) {
+            static unsigned ack_logs;
+            if (ack_logs<24 && (ack_error || ack_ms>=20 || ack_logs<4)) {
+                ++ack_logs;
+                ((void)0);
+            }
+        }
 	}
 	if (header.to_port == QRTR_CONTROL) {
 		struct qrtr_control control = { 0 };
@@ -3300,6 +3541,9 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		qrtr_control(&header, &control);
 		return;
 	}
+    if(header.type==QRTR_DATA && header.to_node==QRTR_US && rbb_reserved_port(header.to_port) &&
+       hakios_is_raphael() && raphael_baseband_enabled() &&
+       raphael_baseband_qrtr(header.to_port,header.from_node,header.from_port,data+at,header.size))return;
 	lck_mtx_lock(&qrtr_lock);
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
 		if (qrtr_ports[p].number == header.to_port && header.type == QRTR_DATA) {
@@ -3354,6 +3598,7 @@ qrtr_open(hakios_qrtr_receive_t receive, hakios_qrtr_server_t server, void *cont
 		if (qrtr_ports[p].number == 0) {
 			port = &qrtr_ports[p];
 			bzero(port, sizeof(*port));
+			qrtr_next_port=rbb_next_general_port(qrtr_next_port);
 			port->number = qrtr_next_port++;
 			port->receive = receive;
 			port->server = server;
@@ -3417,6 +3662,16 @@ qrtr_close(struct hakios_qrtr_port *port)
 
 static const struct hakios_qrtr_ops qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
 
+static int rbb_send(uint32_t local,uint32_t node,uint32_t port,const void *data,uint32_t len) {
+    if(!rbb_reserved_port(local) || !len || len>RBB_QRTR_MAX) return EINVAL;
+    return qrtr_out_packet_mode(QRTR_DATA,local,node,port,data,len,true);
+}
+static int rbb_del_client(uint32_t local) {
+    if(!rbb_reserved_port(local)) return EINVAL;
+    if(!qrtr_peer_known) return ENOTCONN;
+    struct qrtr_control gone={.command=QRTR_DEL_CLIENT,.words={QRTR_US,local}};
+    return qrtr_out_packet_mode(QRTR_DEL_CLIENT,local,qrtr_peer,QRTR_CONTROL,&gone,sizeof gone,true);
+}
 #include "hakios.raphael-sim.h"
 
 /* ---- the link's thread -------------------------------------------------------------------------------- */
@@ -3441,10 +3696,17 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	struct glink_packet *packet;
 	bool gave_up = false;
 
+	const bool native_baseband = hakios_is_raphael() && raphael_baseband_enabled();
+    unsigned bb_publish_ticks = 0;
+    if(native_baseband)raphael_baseband_configure(rbb_send,rbb_del_client);
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
 		link_wait();
+        /* Retry only early deferral; configure returns immediately after publication. */
+        if(native_baseband && ++bb_publish_ticks==1000) {
+            bb_publish_ticks=0;raphael_baseband_configure(rbb_send,rbb_del_client);
+        }
 		doorbells();
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			if (hakios_is_raphael()) show_words("MPSS changed", &words);
@@ -3477,7 +3739,12 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		lck_mtx_lock(&qrtr_calling);
 		qrtr_fresh();
-		raphael_sim_tick();
+        if(hakios_is_raphael())ripa_data_tick();
+		if(hakios_is_raphael() && raphael_baseband_enabled()) {
+            raphael_baseband_poll();
+        }
+		else raphael_sim_tick();
+		tftp_expire();
 		lck_mtx_unlock(&qrtr_calling);
 	}
 	raphael_sim_close();
@@ -3888,7 +4155,20 @@ mpss_storage_start(void)
 	return qrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, qrtr_peer, QRTR_CONTROL, &publish, sizeof(publish)) == 0;
 }
 
-/* Firmware transfer over QRTR, as tqftpserv; only this board's WLAN image is exported. */
+#include "hakios.raphael-mcfg-files.h"
+
+/* Board firmware reads and two bounded session-only modem scratch files.
+ * mcfg.tmp is needed by MPSS initialization. No Android/NV filesystem writes. */
+#define RAPHAEL_TFTP_CAPACITY 65536u
+static struct tftp_ram_file {
+ const char *path;
+ uint8_t data[RAPHAEL_TFTP_CAPACITY];
+ uint32_t size;
+ bool exists, writing;
+} tftp_ram_files[] = {
+ { .path = "readwrite/server_check.txt" },
+ { .path = "readwrite/mcfg.tmp" },
+};
 static struct hakios_qrtr_port *tftp_port;
 static struct tftp_reader {
 	struct hakios_qrtr_port *port;
@@ -3896,10 +4176,28 @@ static struct tftp_reader {
 	uint64_t offset, size;
 	const uint8_t *data;
 	bool last, writing;
+ uint64_t deadline;
+ uint8_t *owned;
+ size_t owned_size;
+ struct tftp_ram_file *memory;
 } tftp_readers[4];
-static uint8_t tftp_check[4096];
-static uint32_t tftp_check_size;
-static bool tftp_check_exists;
+
+static void
+tftp_reader_close(struct tftp_reader *r)
+{
+ if (r->port) qrtr_close(r->port);
+ if (r->owned) kfree_data(r->owned, r->owned_size);
+ if (r->writing && r->memory) r->memory->writing = false;
+ bzero(r, sizeof(*r));
+}
+
+static void
+tftp_expire(void)
+{
+ uint64_t now = now_us();
+ for (unsigned i=0; i<4; i++) if (tftp_readers[i].port && now >= tftp_readers[i].deadline)
+  tftp_reader_close(&tftp_readers[i]);
+}
 
 static void
 tftp_error(struct hakios_qrtr_port *port, uint32_t node, uint32_t remote, uint8_t error)
@@ -3915,29 +4213,34 @@ tftp_data(void *context, uint32_t node, uint32_t port, const void *data, size_t 
 	const uint8_t *bytes = data;
 	uint8_t *packet;
 
-	if (node != reader->node || port != reader->remote || length < 4 || bytes[0] != 0) return;
+	if (!reader->port || node != reader->node || port != reader->remote || length < 4 || bytes[0] != 0) return;
+	reader->deadline = now_us() + 30000000ull;
 	if (bytes[1] == 5) {
 		printf("wifi: TFTP transfer ended by peer: code %u\n", bytes[2] << 8 | bytes[3]);
-		qrtr_close(reader->port); reader->port = NULL; return;
+		tftp_reader_close(reader); return;
 	}
 	if (reader->writing) {
 		if (bytes[1] != 3 || length - 4 > reader->block_size) return;
 		uint32_t block = bytes[2] << 8 | bytes[3];
 		if (block == reader->sent + 1) {
 			uint64_t at = (uint64_t)(block - 1) * reader->block_size;
-			if (at > sizeof(tftp_check) || length - 4 > sizeof(tftp_check) - at) {
-				tftp_error(reader->port, node, port, 3); qrtr_close(reader->port); reader->port = NULL; return;
+			if (at > RAPHAEL_TFTP_CAPACITY - reader->offset || length - 4 > RAPHAEL_TFTP_CAPACITY - reader->offset - at) {
+				tftp_error(reader->port, node, port, 3); tftp_reader_close(reader); return;
 			}
-			memcpy(tftp_check + at, bytes + 4, length - 4);
-			tftp_check_size = (uint32_t)(at + length - 4);
+			memcpy(reader->owned + at, bytes + 4, length - 4);
+			reader->size = at + length - 4;
 			reader->sent = block; reader->last = length - 4 < reader->block_size;
 		} else if (block > reader->sent) return;
 		uint8_t ack[] = { 0, 4, (uint8_t)(reader->sent >> 8), (uint8_t)reader->sent };
 		qrtr_send(reader->port, node, port, ack, sizeof(ack));
 		if (reader->last) {
-			tftp_check_exists = true;
-			printf("wifi: TFTP server_check saved %u bytes in RAM\n", tftp_check_size);
-			qrtr_close(reader->port); reader->port = NULL;
+			struct tftp_ram_file *f = reader->memory;
+   memcpy(f->data + reader->offset, reader->owned, reader->size);
+   uint32_t end = (uint32_t)(reader->offset + reader->size);
+   f->size = reader->offset == 0 || end > f->size ? end : f->size;
+   f->exists = true;
+   printf("wifi: TFTP scratch %s committed %u bytes in RAM only\n", f->path, f->size);
+			tftp_reader_close(reader);
 		}
 		return;
 	}
@@ -3945,8 +4248,8 @@ tftp_data(void *context, uint32_t node, uint32_t port, const void *data, size_t 
 	uint32_t ack = bytes[2] << 8 | bytes[3];
 	if (ack < reader->acked || ack > reader->sent) return;
 	if (reader->last && ack == reader->sent) {
-		printf("wifi: TFTP WLAN image transfer complete: %llu bytes\n", reader->size);
-		qrtr_close(reader->port); reader->port = NULL; return;
+		printf("wifi: TFTP read complete: %llu bytes\n", reader->size);
+		tftp_reader_close(reader); return;
 	}
 	reader->acked = ack;
 	packet = kalloc_data(reader->block_size + 4, Z_WAITOK);
@@ -3976,7 +4279,8 @@ tftp_request(__unused void *context, uint32_t node, uint32_t port, const void *d
 	bool writing;
 	uint32_t block_size = 512, window = 1, timeout = 1000, options = 0;
 	struct tftp_reader *reader = NULL;
-	const uint8_t *file;
+	const uint8_t *file = NULL;
+	struct tftp_ram_file *memory = NULL;
 	uint8_t oack[256] = { 0, 6 };
 	size_t used = 2;
 
@@ -3991,12 +4295,19 @@ tftp_request(__unused void *context, uint32_t node, uint32_t port, const void *d
 	if (count < 2 || count % 2 || strcmp(fields[1], "octet")) goto invalid;
 	printf("wifi: TFTP %s %s, %u option pairs\n", writing ? "write" : "read", fields[0], (count - 2) / 2);
 	const char *path = fields[0] + (fields[0][0] == '/');
-	if (!strcmp(path, "readwrite/server_check.txt")) {
-		file = tftp_check; file_size = writing ? sizeof(tftp_check) : tftp_check_size;
-		if (!writing && !tftp_check_exists) { tftp_error(tftp_port, node, port, 1); return; }
-	} else if (!writing && !strcmp(path, "readonly/firmware/image/wlanmdsp.mbn")) {
+	for (unsigned i=0; i<sizeof(tftp_ram_files)/sizeof(tftp_ram_files[0]); i++)
+  if (!strcmp(path, tftp_ram_files[i].path)) memory = &tftp_ram_files[i];
+ if (memory) {
+  file = memory->data; file_size = writing ? RAPHAEL_TFTP_CAPACITY : memory->size;
+  if (!writing && !memory->exists) { tftp_error(tftp_port,node,port,1); return; }
+ } else if (!writing && !strcmp(path, "readonly/firmware/image/wlanmdsp.mbn")) {
 		file = image_file("wlanmdsp.mbn", &file_size);
 		if (!file || file_size == 0 || file_size > 64 * 1024 * 1024) { tftp_error(tftp_port, node, port, 1); return; }
+	} else if (raphael_mcfg_image_name(path,writing)) {
+        const char *name=raphael_mcfg_image_name(path,writing);
+        file=image_file(name,&file_size);
+        if (!file || file_size!=32) { tftp_error(tftp_port,node,port,1); return; }
+        ((void)0);
 	} else { tftp_error(tftp_port, node, port, writing ? 2 : 1); return; }
 	for (unsigned i = 2; i < count; i += 2) {
 		static const char *const names[] = { "blksize", "wsize", "timeoutms", "tsize", "rsize", "seek" };
@@ -4014,24 +4325,36 @@ tftp_request(__unused void *context, uint32_t node, uint32_t port, const void *d
 		case 0: if (value < 8 || value > 65464) goto invalid; block_size = value > 7680 ? 7680 : (uint32_t)value; break;
 		case 1: if (value < 1 || value > 65535) goto invalid; window = value > 10 ? 10 : (uint32_t)value; break;
 		case 2: if (value < 1 || value > 255000) goto invalid; timeout = (uint32_t)value; break;
-		case 3: if ((!writing && value != 0) || (writing && value > sizeof(tftp_check))) goto invalid; write_size = value; break;
+		case 3: if ((!writing && value != 0) || (writing && value > RAPHAEL_TFTP_CAPACITY)) goto invalid; write_size = value; break;
 		case 4: if (writing || value == 0 || value > file_size) goto invalid; rsize = value; break;
-		case 5: if ((writing && value != 0) || value > file_size) goto invalid; seek = value; break;
+		case 5: if (value > file_size) goto invalid; seek = value; break;
 		}
 	}
-	if ((rsize && rsize > file_size - seek) || (rsize ? rsize : file_size - seek) / block_size >= 65535) goto invalid;
+	if ((rsize && rsize > file_size - seek) || (rsize ? rsize : file_size - seek) / block_size >= 65535 ||
+     (writing && write_size > RAPHAEL_TFTP_CAPACITY - seek)) goto invalid;
 	for (unsigned i = 0; i < 4; i++) {
 		if (tftp_readers[i].port && tftp_readers[i].node == node && tftp_readers[i].remote == port) {
-			qrtr_close(tftp_readers[i].port); tftp_readers[i].port = NULL;
+			tftp_reader_close(&tftp_readers[i]);
 		}
 		if (!tftp_readers[i].port && !reader) reader = &tftp_readers[i];
 	}
-	if (!reader) { tftp_error(tftp_port, node, port, 0); return; }
+	if (!reader || (writing && memory->writing)) { tftp_error(tftp_port, node, port, 0); return; }
 	*reader = (struct tftp_reader){ .node = node, .remote = port, .block_size = block_size, .window = window,
 	    .offset = seek, .size = rsize ? rsize : file_size - seek, .data = file, .writing = writing };
-	if (writing) { reader->window = 1; window = 1; tftp_check_exists = false; tftp_check_size = 0; }
-	reader->port = qrtr_open(tftp_data, NULL, reader);
-	if (!reader->port) return;
+	reader->memory = memory; reader->deadline = now_us() + 30000000ull;
+ if (memory) {
+  /* Read snapshots and staged writes remain valid during a second transfer. */
+  reader->owned_size = writing ? RAPHAEL_TFTP_CAPACITY - seek : reader->size;
+  if (!reader->owned_size) reader->owned_size = 1;
+  reader->owned = kalloc_data(reader->owned_size, Z_WAITOK);
+  if (!reader->owned) { bzero(reader,sizeof(*reader)); return; }
+  if (!writing) {
+   memcpy(reader->owned,file+seek,reader->size);reader->data=reader->owned;reader->offset=0;
+  }
+ }
+ if (writing) { reader->window = 1; window = 1; reader->size = 0; memory->writing = true; }
+ reader->port = qrtr_open(tftp_data, NULL, reader);
+ if (!reader->port) { tftp_reader_close(reader); return; }
 	if (options) {
 		static const char *const names[] = { "blksize", "wsize", "timeoutms", "tsize", "rsize", "seek" };
 		uint64_t values[] = { block_size, window, timeout, writing ? write_size : file_size, rsize, seek };
@@ -4052,7 +4375,7 @@ tftp_request(__unused void *context, uint32_t node, uint32_t port, const void *d
 	}
 	return;
 failed:
-	qrtr_close(reader->port); reader->port = NULL;
+	tftp_reader_close(reader);
 	return;
 invalid:
 	tftp_error(tftp_port, node, port, 8);
@@ -4888,6 +5211,8 @@ step_registers(void)
 	return true;
 }
 
+#include "hakios.raphael-ipa-qmi.h"
+
 static bool
 step_qrtr(void)
 {
@@ -4898,6 +5223,7 @@ step_qrtr(void)
 		return false;
 	}
 	PE_parse_boot_argn("wifi_listen", &seconds, sizeof(seconds));
+	if(hakios_is_raphael() && !ripa_qmi_start())printf("raphael-ipa: SIM-only fallback; IPA QMI not started\n");
 	if (hakios_is_raphael() && hakios_wifi_option("wifi_diag")) mpss_microdump("before WLAN");
 	if (hakios_is_raphael() && hakios_wifi_option("wifi_ask") && hakios_wifi_option("wifi_diag") && !mpss_diag_start()) return false;
 	if (hakios_is_raphael() && hakios_wifi_option("wifi_ask") && (!mpss_storage_start() || !tftp_start())) return false;
@@ -5623,6 +5949,8 @@ steps_over(uint32_t done)
 		dsp_shutdown("the steps are over");
 	}
 	if (!dsp_started) {
+		/* Also release a prebooted IPA if MPSS failed before it started. */
+		if (!raphael_ipa_preboot_stop()) printf("raphael-ipa: cleanup after MPSS startup failure unconfirmed\n");
 		if (hakios_is_raphael()) { icnss_memory_stop(); mpss_storage_stop(); }
 		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
 	}
@@ -5735,6 +6063,8 @@ hakios_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	/* Release: retain startup details for a real failure, suppress routine tracing. */
+	quiet = true;
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

@@ -3302,9 +3302,9 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 		return error;
 
 	case CS_OPS_ENTITLEMENTS_BLOB: {
-		void *start;
-		size_t length;
-		struct cs_blob* blob;
+		void *start = NULL;
+		size_t length = 0;
+		struct cs_blob *blob;
 
 		proc_lock(pt);
 		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) {
@@ -3314,28 +3314,22 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
 		}
 		blob = csproc_get_blob(pt);
 		proc_unlock(pt);
-
-		if (!blob) {
+		if (blob == NULL) {
 			error = EBADEXEC;
 			goto out;
 		}
 
-		void* osent = csblob_os_entitlements_get(blob);
-		if (!osent) {
+		/* miniamfi has no OSEntitlements XML serializer. Return the existing
+		 * embedded XML only after the original code-directory hash check.
+		 * The returned pointer belongs to the cs_blob; never free it here. */
+		error = csblob_get_entitlements(blob, &start, &length);
+		if (error != 0) {
 			goto out;
 		}
-		CS_GenericBlob* xmlblob = NULL;
-		if (amfi->OSEntitlements_get_xml(osent, &xmlblob)) {
-			start = (void*)xmlblob;
-			length = (size_t)ntohl(xmlblob->length);
-		} else {
-			goto out;
-		}
-
 		error = csops_copy_token(start, length, usize, uaddr);
-		kfree_data(start, length);
 		goto out;
 	}
+
 	case CS_OPS_DER_ENTITLEMENTS_BLOB: {
 		const void *start;
 		size_t length;

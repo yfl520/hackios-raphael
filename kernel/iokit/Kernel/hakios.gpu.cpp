@@ -36,6 +36,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 #include <sys/systm.h>
@@ -61,6 +62,7 @@ uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
+void hakios_gpu_power_tick(void);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -308,6 +310,19 @@ HakiosGPU::start(IOService * provider)
 	return true;
 }
 
+static void
+gpuPowerWorker(void *arg __unused, wait_result_t wr __unused)
+{
+    for (;;) {
+        delay_for_interval(100, NSEC_PER_MSEC);
+        IOLockLock(gGPULock);
+        bool ready = hakios_gpu_ready();
+        if (ready) hakios_gpu_power_tick();
+        IOLockUnlock(gGPULock);
+        if (!ready) break;
+    }
+}
+
 void
 HakiosGPUStart(void)
 {
@@ -327,7 +342,15 @@ HakiosGPUStart(void)
 		gpu->detach(provider);
 		IOLog("HakiosGPU: the service did not start\n");
 	}
-	gpu->release();
+    gpu->release();
+    uint32_t policy = 0;
+    if (PE_parse_boot_argn("power_policy", &policy, sizeof(policy)) && policy == 1 && gGPULock) {
+        thread_t worker;
+        if (kernel_thread_start(gpuPowerWorker, NULL, &worker) == KERN_SUCCESS) {
+            thread_set_thread_name(worker, "Raphael GPU power");
+            thread_deallocate(worker);
+        } else IOLog("adreno-power: no worker; original frequency retained\n");
+    }
 }
 
 /* The run is ending (hakios.adreno.c): nobody is in the middle of anything when the GPU goes. */

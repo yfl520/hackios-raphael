@@ -107,6 +107,10 @@ extern  int mockfs_mountroot(mount_t, vnode_t, vfs_context_t);
 extern  struct vfsops ramfs_vfsops;
 #endif /* RAMFS */
 
+#if HFS
+extern  struct vfsops hfs_vfsops;
+#endif /* HFS */
+
 #if APFS
 extern  struct vfsops apfs_vfsops;
 extern  int apfs_mountroot(mount_t, vnode_t, vfs_context_t);
@@ -121,6 +125,7 @@ enum fs_type_num {
 	FT_BINDFS = 23,
 	FT_MOCKFS  = 0x6D6F636B,
 	FT_RAMFS   = 0x72616D66,
+	FT_HFS     = 0x11,
 	FT_APFS    = 0x61706673
 };
 
@@ -223,6 +228,31 @@ static struct vfstable vfstbllist[] = {
 		.vfc_sysctl = NULL
 	},
 #endif /* RAMFS */
+
+#if HFS
+	/*
+	 * HFS Plus, read-write, built in rather than a kext (bsd/hfs, Apple's hfs-627.100.6): the data volume on the
+	 * phone's flash, /private/var, where ramfs keeps it in memory.  Its own arguments (struct hfs_mount_args) and
+	 * local ones, as the kext registered itself (no VFS_TBLGENERICMNTARGS): the kernel looks up the device named
+	 * by their first field and hands its vnode to hfs_mount().  Mounted by init, from user space.
+	 */
+	{
+		.vfc_vfsops = &hfs_vfsops,
+		.vfc_name = "hfs",
+		.vfc_typenum = FT_HFS,
+		.vfc_refcount = 0,
+		.vfc_flags = MNT_LOCAL | MNT_DOVOLFS,
+		.vfc_mountroot = NULL,
+		.vfc_next = NULL,
+		.vfc_reserved1 = 0,
+		.vfc_reserved2 = 0,
+		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
+		    VFC_VFSVNOP_PAGEINV2 | VFC_VFSNATIVEXATTR,
+		.vfc_descptr = NULL,
+		.vfc_descsize = 0,
+		.vfc_sysctl = NULL
+	},
+#endif /* HFS */
 
 #if APFS
 	/*
@@ -362,6 +392,12 @@ extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
 extern const struct vnodeopv_desc ramfs_vnodeop_opv_desc;
 #endif /* RAMFS */
 
+#if HFS
+extern const struct vnodeopv_desc hfs_vnodeop_opv_desc;
+extern const struct vnodeopv_desc hfs_specop_opv_desc;
+extern const struct vnodeopv_desc hfs_fifoop_opv_desc;
+#endif /* HFS */
+
 #if APFS
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
 #endif /* APFS */
@@ -398,6 +434,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
 #if RAMFS
 	&ramfs_vnodeop_opv_desc,
 #endif /* RAMFS */
+#if HFS
+	&hfs_vnodeop_opv_desc,
+	&hfs_specop_opv_desc,
+	&hfs_fifoop_opv_desc,
+#endif /* HFS */
 #if APFS
 	&apfs_vnodeop_opv_desc,
 #endif /* APFS */

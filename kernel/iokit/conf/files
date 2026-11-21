@@ -158,3 +158,5 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
 iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
 
 iokit/Kernel/RaphaelBluetooth.cpp	optional iokitcpp
+
+iokit/Kernel/RaphaelBaseband.cpp	optional iokitcpp

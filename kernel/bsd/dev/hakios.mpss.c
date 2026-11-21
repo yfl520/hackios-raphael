@@ -5143,6 +5143,20 @@ static char cellular_ip[20], cellular_gateway[20], cellular_dns[44];  /* the dat
 static int cellular_data, cellular_mtu;         /* 1 once the data session is up */
 static uint32_t nas_polls, nas_changes;
 
+/* Raphael shares MPSS with WLAN: publish observed NAS state without starting
+ * redwood's modem driver, IPA, WDS, or a second QRTR transport. */
+void
+hakios_raphael_cellular_commit(bool up, const struct hakios_nas_state *state)
+{
+ cellular_up=up;
+ cellular_registered=up && state && state->registered;
+ cellular_bars=cellular_registered ? state->bars : 0;
+ cellular_dbm=up && state && state->has_signal ? state->dbm : 0;
+ cellular_radio=up && state && state->has_signal ? state->radio_interface : 0;
+ snprintf(cellular_operator,sizeof(cellular_operator),"%s",cellular_registered ? state->operator_name : "");
+}
+
+
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_up, 0,
     "the modem runs and its network access service answers");

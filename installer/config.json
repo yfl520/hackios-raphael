@@ -1,0 +1,30 @@
+{
+  "device": "raphael",
+  "resource_offset": 3221225472,
+  "data_first_block": 2042368,
+  "minimum_darwin_blocks": 5242875,
+  "original_twrp": "3.7.1_12-Helium_Studio",
+  "source_partition_generator_commit": "a3384e031eb1e605cf37adaefc19991f04f6274b",
+  "package_version": "蜂窝上网一键包-20261104",
+  "system_bytes": 2780090368,
+  "system_sha256": "7cd98540afa9c0182a1fb5c25b9572bca832bbebe440c7ca334ae935794cbd64",
+  "resource_bytes": 157548544,
+  "kernel_sha256": "2fd14c252a74fd6dfb8c4f7f14dd3929e2575cd6053ed95180aaceb3cbf65081",
+  "resource_template_version": 2,
+  "wireless_inputs": [
+    "modemst1",
+    "modemst2",
+    "fsg",
+    "fsc"
+  ],
+  "nv_failure_policy": "Continue with offline radio startup; Bluetooth settings retained. Wi-Fi cannot be guaranteed without valid local NV.",
+  "requires_android_root": false,
+  "requires_unlocked_bootloader": true,
+  "requires_working_root_twrp": true,
+  "release_phone_tested": false,
+  "baseline": "V9 cellular Internet; V27 Wi-Fi and earlier integrated features; developer observers removed",
+  "cellular_verified_scope": "V9 functional candidate: real IPv4/IPv6/DNS and bidirectional pdp_ip0 traffic; user confirmed Safari searches and result pages with Wi-Fi off. Clean release checked offline. Calls/SMS and reliable airplane-mode recovery not accepted.",
+  "normal_root_sha256": "11e7cc88706b742c78d611725f7d215c92e81615336686bba4ec55fa83465caa",
+  "offline_root_sha256": "7f24abe6449f165fe72fb264ec272dc8198b170492056866cae0ef27d8348227",
+  "wifi_nv_device_specific": true
+}

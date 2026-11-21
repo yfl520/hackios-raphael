@@ -26,6 +26,7 @@
 #include <pexpert/arm64/board_config.h>
 #include <vm/vm_page.h>
 #include <vm/vm_compressor.h>
+#include <sys/reboot.h>
 
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
@@ -192,6 +193,9 @@ extern uint64_t loader_stub_slot[4];
  * it has loaded. The addresses are the kernel's virtual ones, filled in by the linker and so
  * valid from the first instruction; the loader knows the distance to the physical ones.
  */
+#include "computer-link-abi.h"
+extern struct cl_shared computer_link_shared;
+
 struct loader_live {
 	uint64_t magic;                 /* "XNULIVE!" */
 	uint64_t heartbeat;             /* goes up every HV_WDT_PET_SECONDS while the kernel is alive */
@@ -206,6 +210,8 @@ struct loader_live {
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
 	uint64_t magic3;
 	const uint64_t *framebuffer;
+	uint64_t magic4;
+	const struct cl_shared *computer_link;
 };
 
 /*
@@ -230,6 +236,7 @@ struct loader_live loader_live = {
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 	.magic3 = 0x334556494c554e58ULL, .framebuffer = &loader_framebuffer,
+	.magic4 = CL_LIVE_MAGIC, .computer_link = &computer_link_shared,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -495,11 +502,30 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
  */
 static thread_call_t loader_stop_call;
 
+/* A mounted persistent data volume must leave through XNU's normal shutdown.
+ * Its driver remains alive while processes exit and vfs_unmountall flushes it.
+ * On this port halt_all_cpus ultimately hands control back to the loader.
+ * Failure never falls through into the raw RAM-test stop path.
+ */
+static bool
+loader_persistent_stop(void)
+{
+    char volume[64]={0};
+    if(!loader_live.stop || !PE_parse_boot_argn("var_hfs",volume,sizeof(volume)-1) ||
+        strcmp(volume,"ufs_darwin_data"))return false;
+    loader_live.stop=0;
+    printf("loader: persistent stop requests orderly XNU shutdown (sync/unmount enabled)\n");
+    int error=reboot_kernel(RB_HALT,NULL);
+    printf("loader: orderly shutdown returned %d; raw stop refused\n",error);
+    return true;
+}
+
 static void
 loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
 
+	if (loader_persistent_stop()) goto next_poll;
 	if (loader_live.stop) {
 		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
 		for (const char *c = banner; *c; c++) {
@@ -512,6 +538,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		hakios_adsp_stop();
 		loader_return();
 	}
+next_poll:
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(loader_stop_call, deadline);
 }

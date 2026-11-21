@@ -1,6 +1,6 @@
 /* Raphael adaptation, 2026-10-30. Derived from nomorecoolnicknames/hakios-sm8150
  * 3e7be137a100cef19f1d7e83346b6e688be697d1 kernel/bsd/dev/vayu_bt.c.
- * Upstream origin and commit recorded above. Board deltas: odd regulator SIDs,
+ * Origin retained under research/. Board deltas: odd regulator SIDs,
  * serialized shared supply votes, opt-in initialization, RAM-only diagnostics,
  * and disabling the known-bad blanket-success VSC mode. Not hardware-validated.
  */

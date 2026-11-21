@@ -1336,3 +1336,5 @@ sysctl_mib_startup(void)
 
 }
 STARTUP(SYSCTL, STARTUP_RANK_MIDDLE, sysctl_mib_startup);
+
+#include "computer-link-kernel.inc"

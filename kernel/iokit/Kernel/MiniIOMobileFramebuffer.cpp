@@ -38,6 +38,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include "MiniIOSurface.h"
+#include "raphael-screenrec.inc"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 /* the panel's scan (bsd/dev/hakios.display.c; sys/hakios.display.h, which iokit/ does not see) */
@@ -288,7 +289,19 @@ static TUNABLE(uint32_t, gDiff, "fb_diff", 0);
  * little crooked, here and there and never in the same places twice. By default every pixel of the
  * panel is worked out from the four of the picture around where it falls (bilinear).
  */
-static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
+/* Nearest during motion; one bilinear redraw after 40 ms without a swap. */
+static TUNABLE(uint32_t, gFilter, "fb_filter", 2);
+#define SETTLE_MS 40
+static TUNABLE(uint32_t, gThreadPriority, "fb_pri", 92);
+extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
+static kern_return_t
+panel_thread_start(thread_continue_t continuation, void *parameter, thread_t *thread)
+{
+	if (gThreadPriority >= 1 && gThreadPriority <= 95) {
+		return kernel_thread_start_priority(continuation, parameter, (integer_t)gThreadPriority, thread);
+	}
+	return kernel_thread_start(continuation, parameter, thread);
+}
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 /*
@@ -437,19 +450,24 @@ public:
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
+	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
-	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool fSettling;
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+    void drawShared(const RowJob *job,uint32_t *blend);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
 	unsigned        fThreads;
 	IOLock *        fHelperLock;
 	const struct RowJob * fHelperJob;
+    int32_t fNextRow;
 	uint64_t        fHelperGeneration;
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
@@ -477,6 +495,23 @@ setNumber(OSDictionary * dict, const char * key, uint64_t value)
  */
 #define kFBTimingID     1
 #define kFBColorID      1
+
+void
+IOMobileFramebuffer::publishRefresh(void)
+{
+	OSDictionary *refresh = OSDictionary::withCapacity(4);
+	if (refresh == NULL) return;
+	uint32_t hz = refreshHz();
+	uint64_t interval = (1ULL << 32) / hz, ticks;
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / hz, &ticks);
+	setNumber(refresh, "displayMinRefreshInterval", interval);
+	setNumber(refresh, "displayMaxRefreshInterval", interval);
+	setNumber(refresh, "displayRefreshStep", interval);
+	setNumber(refresh, "displayRefreshStepMachTime", ticks);
+	setProperty("IOMFBDisplayRefresh", refresh);
+	refresh->release();
+	IOLog("MiniIOMobileFramebuffer: published actual panel refresh %u Hz\n", hz);
+}
 
 void
 IOMobileFramebuffer::publishModes(void)
@@ -521,6 +556,7 @@ IOMobileFramebuffer::publishModes(void)
 
 	setProperty("TimingElements", timings);
 	setProperty("ColorElements", colors);
+	publishRefresh();
 	OSSafeReleaseNULL(timings);
 	OSSafeReleaseNULL(colors);
 	OSSafeReleaseNULL(timing);
@@ -545,7 +581,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
 	gScanoutLock = IOLockAlloc();
-	if (kernel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
+	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
 		IOLog("MiniIOMobileFramebuffer: no thread to put frames on the panel with\n");
 		return false;
 	}
@@ -554,7 +590,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	fThreads = gThreads >= 1 && gThreads <= 8 ? gThreads : 1;
 	fHelperLock = IOLockAlloc();
 	for (unsigned i = 0; i + 1 < fThreads; i++) {
-		if (kernel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
+		if (panel_thread_start(&IOMobileFramebuffer::helperMain, this, &thread) != KERN_SUCCESS) {
 			fThreads = i + 1;
 			break;
 		}
@@ -627,6 +663,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	}
 	publishModes();
 	setName("disp0");
+	raphael_screenrec_init();
 	registerService();
 	return true;
 }
@@ -734,6 +771,106 @@ sample_at(int64_t i, int64_t in, int64_t out)
 	return at < 0 ? 0 : at > (in - 1) * 256 ? (in - 1) * 256 : at;
 }
 
+/* Bit-exact unsigned-byte bilinear interpolation. On this ARM64 kernel,
+ * exception entry/return saves/restores all Q registers; normal C calls and
+ * context switches follow the AAPCS64 caller/callee convention. Use only v0-v5
+ * (caller saved), no FP arithmetic, rounding, saturation or FPCR changes.
+ * The caller takes the weight-zero / final-row path before arriving here. */
+static inline void
+blend_vertical_row(uint32_t *mixed,const uint32_t *upper,const uint32_t *lower,
+    uint32_t first,uint32_t last,uint32_t weight)
+{
+    uint32_t c=first;
+#if defined(__arm64__) || defined(__aarch64__)
+    unsigned blocks=(last-first+1)/4;
+    if(blocks){
+        const uint32_t *a=upper+first,*b=lower+first;uint32_t *d=mixed+first;
+        unsigned n=blocks,inverse=256-weight;
+        __asm__ volatile(
+            "dup v4.16b, %w[w]\n"
+            "dup v5.16b, %w[i]\n"
+            "1:\n"
+            "ld1 {v0.16b}, [%[a]], #16\n"
+            "ld1 {v1.16b}, [%[b]], #16\n"
+            "umull v2.8h, v0.8b, v5.8b\n"
+            "umlal v2.8h, v1.8b, v4.8b\n"
+            "umull2 v3.8h, v0.16b, v5.16b\n"
+            "umlal2 v3.8h, v1.16b, v4.16b\n"
+            "shrn v2.8b, v2.8h, #8\n"
+            "shrn2 v2.16b, v3.8h, #8\n"
+            "st1 {v2.16b}, [%[d]], #16\n"
+            "subs %w[n], %w[n], #1\n"
+            "b.ne 1b\n"
+            : [a] "+r"(a),[b] "+r"(b),[d] "+r"(d),[n] "+r"(n)
+            : [w] "r"(weight),[i] "r"(inverse)
+            : "v0","v1","v2","v3","v4","v5","cc","memory");
+        c+=blocks*4;
+    }
+#endif
+    for(;c<=last;c++){
+        uint32_t a=upper[c],b=lower[c];
+        mixed[c]=a==b?a:blend(a,b,weight);
+    }
+}
+
+/* Four output pixels, including zero-weight samples. The final source
+ * column stays on the scalar path, so every 64-bit pair load is in bounds. */
+static inline uint32_t
+blend_horizontal_rows(uint32_t *out,const uint32_t *from,const uint32_t *column,
+    const uint16_t *weights,uint32_t n,uint32_t width)
+{
+    uint32_t i=0;
+#if defined(__arm64__) || defined(__aarch64__)
+    static const uint8_t replicate[16]={0,0,0,0,2,2,2,2,4,4,4,4,6,6,6,6};
+    for(;i+4<=n && column[i+3]+1<width;i+=4){
+        const uint32_t *p0=from+column[i],*p1=from+column[i+1],*p2=from+column[i+2],*p3=from+column[i+3];
+        uint32_t equal;
+        __asm__ volatile(
+            "ldr d0, [%[p0]]\n"
+            "ldr d1, [%[p1]]\n"
+            "ldr d2, [%[p2]]\n"
+            "ldr d3, [%[p3]]\n"
+            "zip1 v16.4s, v0.4s, v1.4s\n"
+            "zip1 v17.4s, v2.4s, v3.4s\n"
+            "zip1 v0.2d, v16.2d, v17.2d\n"
+            "zip2 v1.2d, v16.2d, v17.2d\n"
+            "cmeq v2.4s, v0.4s, v1.4s\n"
+            "uminv s2, v2.4s\n"
+            "umov %w[eq], v2.s[0]\n"
+            "cbz %w[eq], 1f\n"
+            "st1 {v0.16b}, [%[out]]\n"
+            "b 2f\n"
+            "1:\n"
+            "ldr d4, [%[weights]]\n"
+            "ldr q5, [%[replicate]]\n"
+            "tbl v4.16b, {v4.16b}, v5.16b\n"
+            "ushll v2.8h, v0.8b, #0\n"
+            "ushll v3.8h, v1.8b, #0\n"
+            "ushll v6.8h, v4.8b, #0\n"
+            "movi v7.8h, #1, lsl #8\n"
+            "sub v7.8h, v7.8h, v6.8h\n"
+            "mul v2.8h, v2.8h, v7.8h\n"
+            "mla v2.8h, v3.8h, v6.8h\n"
+            "shrn v2.8b, v2.8h, #8\n"
+            "ushll2 v3.8h, v0.16b, #0\n"
+            "ushll2 v6.8h, v1.16b, #0\n"
+            "ushll2 v16.8h, v4.16b, #0\n"
+            "movi v7.8h, #1, lsl #8\n"
+            "sub v7.8h, v7.8h, v16.8h\n"
+            "mul v3.8h, v3.8h, v7.8h\n"
+            "mla v3.8h, v6.8h, v16.8h\n"
+            "shrn2 v2.16b, v3.8h, #8\n"
+            "st1 {v2.16b}, [%[out]]\n"
+            "2:\n"
+            : [eq] "=&r"(equal)
+            : [p0] "r"(p0),[p1] "r"(p1),[p2] "r"(p2),[p3] "r"(p3),
+              [out] "r"(out+i),[weights] "r"(weights+i),[replicate] "r"(replicate)
+            : "v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","memory");
+    }
+#endif
+    return i;
+}
+
 /*
  * The rows of one layer, from `y0` to `y1` (panel rows), as drawLayer() has worked them out:
  * scaling a whole frame takes one processor some 9 ms, so with boot-arg fb_threads=N it is shared
@@ -781,11 +918,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 
 				uint32_t * __restrict mixed = blendRow;
 
-				for (uint32_t c = first; c <= last; c++) {
-					uint32_t a = upper[c], b = lower[c];
-
-					mixed[c] = a == b ? a : blend(a, b, weight);           /* (most of a screen is the same as next to it) */
-				}
+				blend_vertical_row(mixed,upper,lower,first,last,weight);
 				from = blendRow;
 			}
 		} else {
@@ -810,7 +943,9 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			const uint16_t * __restrict weights = fColumnWeight + cx0;
 			uint32_t * __restrict out = to + cx0;
 
-			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+            uint32_t n=(uint32_t)(cx1-cx0);
+            uint32_t vectorEnd=blend_horizontal_rows(out,from,column,weights,n,(uint32_t)sw);
+			for (uint32_t i = vectorEnd; i < n; i++) {
 				uint32_t c = column[i], w = weights[i], a = from[c];
 
 				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
@@ -821,6 +956,20 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			}
 		}
 	}
+}
+
+void
+IOMobileFramebuffer::drawShared(const RowJob *job,uint32_t *blend)
+{
+    for(;;){
+        IOLockLock(fHelperLock);
+        int32_t y0=fNextRow,y1=y0+64;
+        if(y1>job->py1)y1=job->py1;
+        if(y0>=job->py1){IOLockUnlock(fHelperLock);break;}
+        fNextRow=y1;
+        IOLockUnlock(fHelperLock);
+        drawRows(job,y0,y1,blend);
+    }
 }
 
 /* A helper of the scaling (fb_threads): waits for rows to do, does them, says so. */
@@ -836,7 +985,7 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 	IOLockUnlock(fb->fHelperLock);
 	for (;;) {
 		const RowJob * job;
-		int32_t rows, y0, y1;
+
 		uint32_t * blend;
 
 		IOLockLock(fb->fHelperLock);
@@ -845,13 +994,15 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		}
 		done = fb->fHelperGeneration;
 		job = fb->fHelperJob;
+        /* Enroll under the same lock that protects job closure. Helpers which
+         * wake after all rows were claimed never retain a pointer to the job. */
+        bool participate=job!=NULL && fb->fNextRow<job->py1;
+        if(participate)fb->fHelpersBusy++;
 		IOLockUnlock(fb->fHelperLock);
+        if(!participate)continue;
 		/* share index + 1 of fThreads (the presenter takes share 0) */
-		rows = job->py1 - job->py0;
-		y0 = job->py0 + (int32_t) ((int64_t) rows * (index + 1) / fb->fThreads);
-		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
-		blend = fb->fHelperBlend[index];
-		fb->drawRows(job, y0, y1, blend);
+        blend = fb->fHelperBlend[index];
+        fb->drawShared(job,blend);
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -872,7 +1023,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
 	int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
 	int32_t px0, py0, px1, py1, cx0, cx1;
-	bool filter = gFilter != 0;
+	bool filter = gFilter == 1 || (gFilter == 2 && fSettling);
 	RowJob job;
 
 	if (sw <= 0 || sh <= 0) {
@@ -953,16 +1104,20 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
 	IOLockLock(fHelperLock);
+    fNextRow=py0;
 	fHelperJob = &job;
-	fHelpersBusy = fThreads - 1;
+	fHelpersBusy = 0;
 	fHelperGeneration++;
 	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
 	IOLockUnlock(fHelperLock);
-	drawRows(&job, py0, py0 + (int32_t) ((int64_t) (py1 - py0) / fThreads), fBlendRow);
+    drawShared(&job,fBlendRow);
 	IOLockLock(fHelperLock);
 	while (fHelpersBusy != 0) {
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 	}
+    /* No enrolled helper can still read the stack job or its column/scratch
+     * inputs. A late wake observes NULL (or the next generation) under lock. */
+    fHelperJob=NULL;
 	IOLockUnlock(fHelperLock);
 }
 
@@ -1053,29 +1208,103 @@ IOMobileFramebuffer::presenterMain(void * self, wait_result_t result __unused)
 void
 IOMobileFramebuffer::presenter(void)
 {
-	static uint8_t swap[SWAP_SIZE];         /* (one thread) */
-	MiniIOSurface * surfaces[SWAP_LAYERS];
-
+	static uint8_t swap[SWAP_SIZE];
+	MiniIOSurface *surfaces[SWAP_LAYERS] = { NULL };
+	bool unsettled = false;
+	uint64_t deadline = 0;
 	for (;;) {
 		IOLockLock(fSwapLock);
 		while (fSwapsWaiting == 0) {
-			IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+			if (!unsettled) {
+				IOLockSleep(fSwapLock, fSwap, THREAD_UNINT);
+				continue;
+			}
+			if (IOLockSleepDeadline(fSwapLock, fSwap, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fSwapsWaiting == 0) {
+				IOLockUnlock(fSwapLock);
+				settle(swap, surfaces);
+				unsettled = false;
+				for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+					if (surfaces[layer] != NULL) MiniIOSurfaceDrop(surfaces[layer]);
+					surfaces[layer] = NULL;
+				}
+				IOLockLock(fSwapLock);
+			}
 		}
+		IOLockUnlock(fSwapLock);
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (surfaces[layer] != NULL) MiniIOSurfaceDrop(surfaces[layer]);
+			surfaces[layer] = NULL;
+		}
+		IOLockLock(fSwapLock);
 		memcpy(swap, fSwap[fSwapFirst], SWAP_SIZE);
 		memcpy(surfaces, fSwapSurfaces[fSwapFirst], sizeof(surfaces));
 		IOLockUnlock(fSwapLock);
-		show(swap, surfaces);
-		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-			if (surfaces[layer] != NULL) {
-				MiniIOSurfaceDrop(surfaces[layer]);
+		unsettled = show(swap, surfaces) && gFilter == 2;
+		clock_interval_to_deadline(SETTLE_MS, NSEC_PER_MSEC, &deadline);
+		if (!unsettled) {
+			for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+				if (surfaces[layer] != NULL) MiniIOSurfaceDrop(surfaces[layer]);
+				surfaces[layer] = NULL;
 			}
 		}
-		MiniIOSurfaceClearKept();               /* (the next frame is some milliseconds away) */
+		MiniIOSurfaceClearKept();
 	}
 }
 
-/* A swap's surfaces onto the panel, once the GPU is done with them. */
+/* A settle is not a new swap: do not acknowledge it or advance the queue.
+ * Preserve the Raphael scanout -> frame lock order and render to the back
+ * buffer, copying the current front for partial/absent layers before flipping.
+ * Skip a stale settle if another swap arrives or its GPU work is unfinished. */
 void
+IOMobileFramebuffer::settle(const uint8_t *swap, MiniIOSurface **surfaces)
+{
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], 0)) return;
+	}
+	IOLockLock(gScanoutLock);
+	IOLockLock(fLock);
+	IOLockLock(fSwapLock);
+	bool pending = fSwapsWaiting != 0;
+	IOLockUnlock(fSwapLock);
+	if (!fGraphics || pending) {
+		IOLockUnlock(fLock);
+		IOLockUnlock(gScanoutLock);
+		return;
+	}
+	if (fPageFlip) {
+		uint8_t *back = (uint8_t *)raphael_display_back(!raphael_screenrec_cached());
+		if (back == NULL) {
+			IOLockUnlock(fLock);
+			IOLockUnlock(gScanoutLock);
+			return;
+		}
+		fBase = back;
+	}
+	uint8_t *scanoutBase=fBase;
+	fBase=raphael_screenrec_render_begin(fBase,fPanelWidth,fPanelHeight,fRowBytes);
+	fSettling = true;
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		MiniIOSurface *s = surfaces[layer];
+		if (s == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0) continue;
+		int32_t src[4], dst[4];
+		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+		drawLayer(s, src, dst);
+	}
+	fSettling = false;
+	if(fBase!=scanoutBase)memcpy(scanoutBase,fBase,(size_t)fRowBytes*fPanelHeight);
+	raphael_screenrec_present(fBase,fPanelWidth,fPanelHeight,fRowBytes);
+	fBase=scanoutBase;
+	if (fPageFlip && !raphael_display_present()) {
+		fPageFlip = false;
+		fBase = (uint8_t *)vinfo.v_baseaddr;
+	}
+	IOLockUnlock(fLock);
+	IOLockUnlock(gScanoutLock);
+}
+
+/* A swap's surfaces onto the panel, once the GPU is done with them. */
+bool
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
@@ -1100,7 +1329,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		IOLockWakeup(fSwapLock, &fSwapCompleted, true);
 		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 		IOLockUnlock(fSwapLock);
-		return;
+		return false;
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
@@ -1141,13 +1370,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    (int64_t)src[1] + src[3] <= bottom->info.height)) &&
 		    (dst[2] <= 0 || dst[3] <= 0 || (dst[0] <= 0 && dst[1] <= 0 &&
 		    (int64_t)dst[0] + dst[2] >= fWidth && (int64_t)dst[1] + dst[3] >= fHeight));
-		fBase = (uint8_t *)raphael_display_back(!full);
+		fBase = (uint8_t *)raphael_display_back(!full && !raphael_screenrec_cached());
 		if (fBase == NULL) {
 			fPageFlip = false;
 			fBase = (uint8_t *)vinfo.v_baseaddr;
 		}
 	}
 	IOLockLock(fLock);
+	uint8_t *scanoutBase=fBase;
+	fBase=raphael_screenrec_render_begin(fBase,fPanelWidth,fPanelHeight,fRowBytes);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
 		nanos /= NSEC_PER_MSEC;
@@ -1213,6 +1444,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	if(fBase!=scanoutBase)memcpy(scanoutBase,fBase,(size_t)fRowBytes*fPanelHeight);
+	raphael_screenrec_present(fBase,fPanelWidth,fPanelHeight,fRowBytes);
+	fBase=scanoutBase;
 	if (fPageFlip && !raphael_display_present()) {
 		fPageFlip = false;
 		fBase = (uint8_t *)vinfo.v_baseaddr;
@@ -1293,6 +1527,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatSince = 0;
 	}
 	IOLockUnlock(fLock);
+	return true;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

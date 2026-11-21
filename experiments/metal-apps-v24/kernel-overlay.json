@@ -1,0 +1,8 @@
+[
+  "iokit/Kernel/hakios.gpu.cpp",
+  "iokit/Kernel/hakios.native-metal.h",
+  "iokit/Kernel/minifb-compose.h",
+  "iokit/Kernel/MiniIOMobileFramebuffer.cpp",
+  "iokit/Kernel/NativeAdrenoABI.h",
+  "bsd/dev/hakios.adreno.c"
+]

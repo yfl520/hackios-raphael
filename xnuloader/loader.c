@@ -10,6 +10,7 @@
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
  */
 #include "efi.h"
+#include "computer-link-abi.h"
 #include "../kernel/bsd/sys/hakios.loader-display.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
 
@@ -169,6 +170,8 @@ str_eq(const char *a, const char *b)
  * the screen is left to the kernel (and to "oem screenshot").
  */
 static int screen_quiet;
+#include "computer-link-console.inc"
+#include "computer-link-serial-console.inc"
 
 static void
 put_char(char c)
@@ -300,8 +303,6 @@ static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 
-static uint64_t raphael_power_append(char *, uint64_t, uint64_t);
-
 static void
 compose_logs(const char *klog, uint64_t klog_len)
 {
@@ -311,7 +312,6 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_data = out_buf;
 	memset(out_buf, 0, sizeof(out_buf));
 	memcpy(out_buf, log_buf, log_len);
-	n = raphael_power_append(out_buf, sizeof(out_buf) - 8192, n);
 	if (klog != NULL) {
 		if (klog_len > sizeof(out_buf) - n - 8192) {
 			klog_len = sizeof(out_buf) - n - 8192;
@@ -874,6 +874,7 @@ struct kernel_live {
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
 	uint64_t magic3, framebuffer;   /* current scanout PA, through a kernel virtual pointer */
+	uint64_t magic4, computer_link;
 };
 
 /*
@@ -1115,8 +1116,6 @@ soc_from_voltage(uint32_t mv)
 	return 100;
 }
 
-#include "raphael-input-power2.h"
-
 /* Raphael's native FG query: no charger initialize/enable/TakeAction or SOC estimate. */
 static void
 charger_poll_raphael(void)
@@ -1138,15 +1137,20 @@ charger_poll_raphael(void)
 	charger_shared.soc_percent = valid ? (int32_t)status.percent : -1;
 	charger_shared.voltage_mv = valid ? status.voltage_mv :
 	    (!EFI_ERROR(vp) && voltage >= 2500 && voltage <= 5000 ? (int32_t)voltage : -1);
-	/* Qualcomm FG reports negative current into the battery; the XNU cache uses that sign. */
+	/* Keep the raw Qualcomm FG current for diagnostics.  On Raphael its sign is
+	 * not stable while a cable is attached (the PMIC can report both polarities
+	 * during USB negotiation), so it is not suitable as the charging predicate. */
 	charger_shared.current_ma = valid ? status.current_ma : 0;
 	charger_shared.temperature_c = valid ? status.temperature_c : -273;
 	if (!EFI_ERROR(bp) && present) flags |= LOADER_BATTERY_PRESENT;
 	if (!EFI_ERROR(cp) && plugged) flags |= LOADER_BATTERY_CHARGER_PRESENT;
 	if (charger_shared.voltage_mv >= 2500) flags |= LOADER_BATTERY_VOLTAGE_VALID;
 	if (valid) flags |= LOADER_BATTERY_VALID;
-	/* Cable presence alone is not charging; require measured current into the cell. */
-	if (valid && plugged && status.current_ma < 0) flags |= LOADER_BATTERY_CHARGING;
+	/* Raphael's ChargerEx presence plus a non-full valid gauge is the reliable
+	 * charging indication.  The FG current changes sign during negotiation and
+	 * made the old '< 0' test clear the iOS charging icon while Android still
+	 * reported Charging. */
+	if (valid && plugged && status.percent < 100) flags |= LOADER_BATTERY_CHARGING;
 	charger_shared.flags = flags;
 	charger_shared.charger_action = 0xffffffffu;
 	charger_shared.polls++;
@@ -1161,7 +1165,6 @@ charger_poll_raphael(void)
 	charger_shared.sequence++;
 	clean_dcache((uint64_t)(uintptr_t)&charger_shared,
 	    (uint64_t)(uintptr_t)&charger_shared + sizeof(charger_shared));
-	raphael_power_poll();
 }
 
 /* Read-only status query.  No TakeAction call and no charger-limit writes are made here. */
@@ -1592,6 +1595,9 @@ ufs_survey(void)
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
+#define BLOCK_OP_WRITE_FAST 2u
+#define BLOCK_OP_FLUSH 3u
+#define BLOCK_CAN_FAST 1u
 
 /*
  * The one partition a write may reach, and from which of its blocks. darwin is the port's own
@@ -1601,23 +1607,10 @@ ufs_survey(void)
  * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
  * same partition, named the same, of the same size, in the same place, on logical unit 0.
  */
-/* Local storage identities are private build inputs. The source export has
- * an empty write allowlist; RAM boot needs no local-storage.h. A separately
- * verified local deployment may supply all BLOCK_* definitions in that ignored
- * header. Never copy another phone's GUIDs or partition boundaries. */
-#if __has_include("local-storage.h")
-#include "local-storage.h"
-#else
-#define BLOCK_WRITE_FIRST  (~0ULL)
-#define BLOCK_DARWIN_FIRST 0ULL
-#define BLOCK_DARWIN_LAST  0ULL
-#define BLOCK_DARWIN_TYPE  { 0 }
-#define BLOCK_DARWIN_UNIQ  { 0 }
-#define BLOCK_RAPHAEL_FIRST 0ULL
-#define BLOCK_RAPHAEL_LAST  0ULL
-#define BLOCK_RAPHAEL_TYPE { 0 }
-#define BLOCK_RAPHAEL_UNIQ { 0 }
-#endif
+#include "raphael-data-config.h"
+#define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+#define BLOCK_DARWIN_MIN   5242875ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
+#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1651,7 +1644,7 @@ struct loader_block {
 	 * which is a read, and a loader that does not know them leaves these zero, which is no write.
 	 */
 	uint32_t write_part_plus_one;
-	uint32_t write_reserved;
+	uint32_t write_caps;
 	uint64_t write_first;
 	/* written by the kernel: what it wants, then request is advanced */
 	struct {
@@ -1957,45 +1950,38 @@ block_tables(void)
 static int
 block_is_store(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid darwin_type = BLOCK_DARWIN_TYPE, darwin_uniq = BLOCK_DARWIN_UNIQ;
-	static const efi_guid raphael_type = BLOCK_RAPHAEL_TYPE, raphael_uniq = BLOCK_RAPHAEL_UNIQ;
-	int raphael = PLAT == &platform_raphael;
-	const efi_guid *type = raphael ? &raphael_type : &darwin_type;
-	const efi_guid *uniq = raphael ? &raphael_uniq : &darwin_uniq;
-	const char *name = raphael ? "userdata" : "darwin";
-	uint64_t first = raphael ? BLOCK_RAPHAEL_FIRST : BLOCK_DARWIN_FIRST;
-	uint64_t last = raphael ? BLOCK_RAPHAEL_LAST : BLOCK_DARWIN_LAST;
+	if (!RAPHAEL_DATA_ARMED || PLAT != &platform_raphael) return 0;
+	static const efi_guid type = BLOCK_DARWIN_TYPE;
+	const uint8_t *u = (const uint8_t *)&info->unique_guid;
+	static const char name[] = "darwin";
 	const char *why = NULL;
-	if (first == 0 || last <= first || BLOCK_WRITE_FIRST >= last - first + 1) {
-		return 0;               /* no verified local write allowlist */
-	}
 
-	for (unsigned i = 0; i <= str_len(name); i++) {
+	for (unsigned i = 0; i < sizeof(name); i++) {
 		if (bp->name[i] != name[i]) {
 			return 0;               /* another partition: nothing to say about it */
 		}
 	}
-	if (memcmp(&info->type_guid, type, sizeof(*type)) != 0) {
+	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, uniq, sizeof(*uniq)) != 0) {
-		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != first || info->end_lba != last) {
-		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != last - first + 1) {
-		why = "its blocks are not what they were";
+	} else if (bp->block_size != 4096 || bp->blocks < BLOCK_DARWIN_MIN ||
+	    info->end_lba - info->start_lba + 1 != bp->blocks) {
+		why = "it is not 20 GiB in blocks of 4096";
+	} else if ((bp->flags & BLOCK_PART_UNIT) || !bio->write_blocks || !bio->flush_blocks) {
+        why = "not a writable partition with flush support";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
 	if (why != NULL) {
-		print("ufs: %s: no write will be served: %s\n", name, why);
+		print("ufs: darwin: no write will be served: %s\n", why);
 		return 0;
 	}
-	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n", name,
-	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
+	print("ufs: darwin (LBA %d..%d of unit 0, unique GUID %x...%x): its blocks from %d on may be written this run\n",
+	    info->start_lba, info->end_lba, (uint64_t)u[3] << 24 | (uint64_t)u[2] << 16 | (uint64_t)u[1] << 8 | u[0],
+	    (uint64_t)u[12] << 24 | (uint64_t)u[13] << 16 | (uint64_t)u[14] << 8 | u[15], BLOCK_WRITE_FIRST);
 	return 1;
 }
 
@@ -2119,6 +2105,7 @@ block_start(void)
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
 		block_shared.write_first = BLOCK_WRITE_FIRST;
+        block_shared.write_caps = BLOCK_CAN_FAST;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2244,7 +2231,7 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
-		} else if (op == BLOCK_OP_WRITE) {
+		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
 			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
@@ -2253,6 +2240,17 @@ block_poll(void)
 				}
 				s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 				bytes = 0;
+			} else if (op == BLOCK_OP_FLUSH) {
+				s = bio->flush_blocks(bio);
+				bytes = 0;
+			} else if (op == BLOCK_OP_WRITE_FAST) {
+				flush_dcache((uint64_t)(uintptr_t)block_buffer,
+				    (uint64_t)(uintptr_t)block_buffer + bytes);
+				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				if (!EFI_ERROR(s)) {
+					block_writes++;
+					block_write_bytes += bytes;
+				}
 			} else {
 				/*
 				 * The kernel filled the buffer and cleaned its lines of it; drop whatever this
@@ -2267,8 +2265,8 @@ block_poll(void)
 				want = ufs_crc32(block_buffer, bytes);
 				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
-					bio->flush_blocks(bio);
-					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					s = bio->flush_blocks(bio);
+                    if (!EFI_ERROR(s)) s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
@@ -2888,6 +2886,8 @@ choose_window(const struct payload_info *pi)
  */
 static int starts_with(const char *s, const char *prefix);
 
+#include "recovery-load.inc"
+
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -3008,9 +3008,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0, display_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/hakios.torch.c) */
 	int torch_requested = 0;
-	power_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/hakios.camera.c) */
 	int camera_requested = 0;
+	int native_baseband_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -3021,8 +3021,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}
-		power_requested |= starts_with(c, "chg=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[5] == 0 || c[5] == ' ');
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
@@ -3030,6 +3028,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[11] == 0 || c[11] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
+		native_baseband_requested |= starts_with(c, "raphael_native_bb=1") && (c == pi.cmdline || c[-1] == ' ') && (c[19] == 0 || c[19] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
@@ -3042,7 +3041,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    c[11] <= '9';
 	}
 	if (battery_requested) {
-		raphael_power_start();
 		charger_start();
 	}
 	display_enabled = 0;
@@ -3333,6 +3331,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	dt_end(&w);
 
+	if (native_baseband_requested) {
+		dt_begin(&w, "baseband");
+		dt_prop_str(&w, "device_type", "baseband");
+		dt_prop_str(&w, "compatible", "baseband,n41");
+		dt_prop_u32(&w, "class", 3);
+		dt_end(&w);
+	}
 	/* IOKit publishes its NVRAM object on this node; without it IOKit asserts. */
 	dt_begin(&w, "options");
 	dt_end(&w);
@@ -3480,7 +3485,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			jump_to_kernel((uint64_t)(uintptr_t)&loader_return_stub, 0);
 		}
 		if (kernel_mpidr != this_mpidr) {
+			cl_console_acquire();
+			cl_sio_acquire();
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
+			cl_sio_release();
+			cl_console_release();
 			if (display_enabled && hc_list_is_uefis()) {
 				efi_status restored = DISPLAY_CONTROL->set_brightness(0, display_original);
 				print("display: restore original brightness %d%%: %x\n", (uint64_t)display_original, restored);
@@ -3686,96 +3695,24 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
-static int usb_rx_queued;
-static int usb_recovery_pending;
+static int usb_debug_fault;
+static uint64_t cd_send_errors,cd_event_errors,cd_duplicate_attach,cd_active_events,cd_timeouts,cd_last_status;
+#include "computer-link-usb-wait.inc"
 
-/* Cancel firmware requests before forgetting their software bookkeeping.
- * Cancellation notifications are drained before reusing the transfer buffers.
- * Only the two fastboot bulk endpoints are touched, never endpoint zero. */
-static void
-usb_cancel_pending(void)
-{
-	usb_rx_queued = 0;
-	usb_recovery_pending = 1;
-	if (USB != NULL && USB->abort_xfer != NULL) {
-		USB->abort_xfer(USB_EP_OUT);
-		USB->abort_xfer(USB_EP_IN);
-	}
-}
-
-static int
-usb_prepare_transfer(void)
-{
-	if (!usb_recovery_pending) return usb_connected;
-	/* Bounded: leave the kernel monitor running if firmware keeps producing
-	 * events. The caller retries on its next command/event-loop iteration. */
-	for (unsigned i = 0; i < 64; i++) {
-		uint32_t msg = UsbDeviceEventNoEvent;
-		uint64_t size = 0;
-		usb_device_event_data data;
-		if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) return 0;
-		if (msg == UsbDeviceEventDeviceStateChange) {
-			usb_connected = data.device_state == UsbDeviceStateConnected;
-			usb_cancel_pending();
-		} else if (msg == UsbDeviceEventNoEvent) {
-			usb_recovery_pending = 0;
-			return usb_connected;
-		}
-	}
-	return 0;
-}
-
-static int64_t
-usb_wait(uint8_t endpoint)
-{
-	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
-	static uint64_t last_pet;
-	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
-
-	for (;;) {
-		uint32_t msg = UsbDeviceEventNoEvent;
-		uint64_t size = 0;
-		usb_device_event_data data;
-
-		if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
-			usb_cancel_pending();
-			return -1;
-		}
-		if (msg == UsbDeviceEventDeviceStateChange) {
-			usb_connected = (data.device_state == UsbDeviceStateConnected);
-			usb_cancel_pending();
-			return -1;
-		}
-		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
-			if (data.transfer.status != UsbDeviceTransferStatusActive &&
-			    data.transfer.status != UsbDeviceTransferStatusCompleteOK) {
-				usb_cancel_pending();
-				return -1;
-			}
-			if (data.transfer.status == UsbDeviceTransferStatusCompleteOK)
-				return (int64_t)data.transfer.bytes_completed;
-		}
-		/* Consume an already completed transfer before considering its timeout. */
-		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
-			usb_cancel_pending();
-			return -1;
-		}
-		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
-			last_pet = READ_SYSREG(CNTVCT_EL0);
-			wdt_pet();
-		}
-	}
-}
-
+static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
 
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
 {
-	if (!usb_prepare_transfer()) return -1;
 	if (usb_rx_queued) {
 		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
-	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
-		return -1;
+	} else if (usb_debug_fault) { return -1;
+    } else {
+        efi_status status=USB->send(USB_EP_OUT,len,buf);
+        if (EFI_ERROR(status)) {
+            cd_send_errors++; cd_last_status=status; usb_debug_fault=1;
+            (void)USB->abort_xfer(USB_EP_OUT); return -1;
+        }
 	}
 	return usb_wait(USB_EP_OUT);
 }
@@ -3783,13 +3720,15 @@ usb_rx(uint8_t *buf, uint64_t len)
 static int64_t
 usb_tx(const uint8_t *data, uint64_t len)
 {
-	if (!usb_prepare_transfer()) return -1;
 	if (data != usb_tx_buf) {
 		memcpy(usb_tx_buf, data, len);
 	}
-	if (EFI_ERROR(USB->send(USB_EP_IN, len, usb_tx_buf))) {
-		return -1;
-	}
+	if (usb_debug_fault) return -1;
+    efi_status status=USB->send(USB_EP_IN,len,usb_tx_buf);
+    if (EFI_ERROR(status)) {
+        cd_send_errors++; cd_last_status=status; usb_debug_fault=1;
+        (void)USB->abort_xfer(USB_EP_IN); return -1;
+    }
 	return usb_wait(USB_EP_IN);
 }
 
@@ -3884,13 +3823,18 @@ fb_read_part(char *args)
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
  */
+#include "computer-link-loader.inc"
+#include "computer-link-native.inc"
+
 static void
 fb_command(char *cmd)
 {
 	int busy = running_live != NULL;
+	if (cn_command(cmd)) return;
+	if (cl_loader_command(cmd)) return;
 
 	{
-		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+		if (busy && (starts_with(cmd, "oem ramdisk") || (starts_with(cmd, "download:") && !computer_link_download_stream) || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
 		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
 		    starts_with(cmd, "oem read-part"))) {
@@ -3938,6 +3882,8 @@ fb_command(char *cmd)
 			}
 			download_to_ramdisk = 1;
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "download:") && computer_link_download_stream) {
+			cl_loader_download(cmd + 9);
 		} else if (starts_with(cmd, "download:")) {
 			uint64_t total = parse_number(cmd + 9, 16), got = 0;
 			uint64_t limit = PAYLOAD_MAX_SIZE - 0x100000;
@@ -4077,52 +4023,7 @@ fb_command(char *cmd)
  * something meanwhile, without waiting for it to. This is how a run can be asked to end, and
  * the screen and the log be had while it lasts.
  */
-static void
-usb_poll_command(void)
-{
-	uint32_t msg = UsbDeviceEventNoEvent;
-	uint64_t size = 0, n;
-	usb_device_event_data data;
-	char cmd[128];
-
-	if (USB == NULL) return;
-	if (usb_recovery_pending) {
-		usb_prepare_transfer();
-		if (usb_recovery_pending) return;
-	}
-	/* Process old events before submitting a new receive. */
-	if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
-		usb_cancel_pending();
-		return;
-	}
-	if (msg == UsbDeviceEventDeviceStateChange) {
-		usb_connected = data.device_state == UsbDeviceStateConnected;
-		usb_cancel_pending();
-		return;
-	}
-	if (msg == UsbDeviceEventNoEvent) {
-		if (!usb_rx_queued && usb_connected) {
-			if (!EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) usb_rx_queued = 1;
-			else usb_cancel_pending();
-		}
-		return;
-	}
-	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) return;
-	if (data.transfer.status == UsbDeviceTransferStatusActive) return;
-	if (data.transfer.status != UsbDeviceTransferStatusCompleteOK) {
-		/* A late cancelled event may belong to an earlier receive. Cancel
-		 * any newer pending request too, then drain, so flags stay in sync. */
-		usb_cancel_pending();
-		return;
-	}
-	if (!usb_rx_queued || !usb_connected) return;
-	usb_rx_queued = 0;
-	if (data.transfer.bytes_completed == 0) return;
-	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
-	memcpy(cmd, usb_rx_buf, (size_t)n);
-	cmd[n] = 0;
-	fb_command(cmd);
-}
+#include "computer-link-debug-poll.inc"
 
 static void
 usb_command_loop(void)
@@ -4132,7 +4033,7 @@ usb_command_loop(void)
 		char cmd[128];
 		int64_t n;
 
-		if (!usb_connected) {
+		if (!usb_connected || usb_debug_fault) {
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
 		}
@@ -4279,6 +4180,15 @@ efi_main(efi_handle image, efi_system_table *st)
 		}
 	}
 	wdt_arm();
+
+    int diagnostic_usb=usb_start();
+    if (recovery_load()) {
+        screen_quiet=1;
+        run_kernel(0,0);
+    }
+    if (diagnostic_usb) usb_command_loop();
+    reboot();
+    return 0;
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {

@@ -2331,3 +2331,5 @@ IOPanicPlatform::start(IOService * provider)
 
 	return false;
 }
+
+#include "computer-link-iokit.inc"

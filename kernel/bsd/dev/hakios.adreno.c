@@ -92,6 +92,7 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include "raphael-power-policy.h"
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -2316,7 +2317,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	queue->write = at;
 	settle();
 	wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1);
-	for (int i = 0; i < 10000 && !answered; i++) {
+	for (int i = 0, attempts = !strcmp(what, "load-scaled frequency") ? 50 : 10000; i < attempts && !answered; i++) {
 		sleep_us(100);
 		waiting = rd(gmu.base + GMU_GMU2HOST_INTR_INFO);
 		if (waiting & 1) {
@@ -2333,7 +2334,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		    answered ? "says no" : "does not answer", verdict, what, rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
 		    rd(gmu.base + GMU_GMU2HOST_INTR_INFO));
 		space_faulted(&gmu_space);
-		if (!post_mortem_done) {
+		if (!post_mortem_done && strcmp(what, "load-scaled frequency")) {
 			post_mortem_done = true;
 			gmu_post_mortem();
 		}
@@ -2375,6 +2376,11 @@ static struct block gpu = { "gpu", 0x03d00000, 0x40000 };
 #define GMU_CORE_REQUEST        (1u << 30)      /* of host2gmu_intr_set: keep the 3D core up for us; bit 31: no more */
 #define GMU_CORE_GRANTED        (1u << 31)      /* of gmu2host_intr_info */
 
+static uint32_t power_level = 4;
+static bool power_enabled, power_failed;
+static uint64_t power_ticks, power_last_ticks, power_last_time;
+static unsigned power_quiet;
+static uint32_t core_max_khz;
 static uint32_t core_khz;               /* the 3D core's speed, as asked of the GMU */
 
 /*
@@ -2455,6 +2461,10 @@ step_core_power(void)
 		vote[2] = 4;
 	}
 	core_khz = speeds[vote[2]].khz;
+    core_max_khz = core_khz;
+    power_level = vote[2];
+    uint32_t policy = 0;
+    power_enabled = a640 && !speed && PE_parse_boot_argn("power_policy", &policy, sizeof(policy)) && policy == 1;
 	printf("adreno: %u: the speed wanted: %u MHz, RPMh vote %#x\n", step, core_khz / 1000, perf.gpu[vote[2]].vote);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
@@ -3408,7 +3418,7 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = core_khz * 1000ull;
+		*value = core_max_khz * 1000ull; /* MAX_FREQ is capacity, not the idle governor rate. */
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -3565,9 +3575,51 @@ gpu_times(void)
 			}
 			gpu_timed_by[by]++;
 			gpu_ticks += ticks;
+            power_ticks += ticks;
 			gpu_timed_count++;
 		}
 	}
+}
+
+
+/* Called with the existing GPU client lock held, from a sleeping 100ms worker.
+ * Only lower the rate after submitted work finishes. HFI is serial here and
+ * in submission/stop; no PLL or voltage registers are written by this policy.
+ * Linux a6xx_hfi_set_freq uses the same GX_BW_PERF_VOTE (HFI v2).
+ */
+void
+hakios_gpu_power_tick(void)
+{
+    if (!gpu_kept || !power_enabled || power_failed) return;
+    uint64_t now = mach_absolute_time(), ns = 0;
+    gpu_times();
+    if (!power_last_time) {
+        power_last_time = now; power_last_ticks = power_ticks;
+        return;
+    }
+    absolutetime_to_nanoseconds(now - power_last_time, &ns);
+    if (ns < 100 * NSEC_PER_MSEC) return;
+    uint64_t worked = (power_ticks - power_last_ticks) * 10 / 192;
+    power_last_time = now; power_last_ticks = power_ticks;
+    uint32_t wanted = raphael_gpu_level(core_khz, worked, ns / NSEC_PER_USEC);
+    /* A queue still occupied at the sampling point needs the existing maximum.
+     * Runtime HFI upvotes are the Linux path; defer only downvotes until idle. */
+    if (!hakios_gpu_done(gpu_fence)) { power_quiet = 0; wanted = 4; }
+    if (wanted < power_level) { if (++power_quiet < 5) return; }
+    else power_quiet = 0;
+    if (wanted == power_level) return;
+    uint32_t vote[4] = { 0, 1, wanted, HFI_NO_INDEX };
+    /* Limit this optional request to Linux's 5ms acknowledgement deadline.
+     * If transport fails, stop requests for this run; never repeatedly stall UI. */
+    bool accepted = hfi_send("load-scaled frequency", HFI_GX_BW_PERF_VOTE, vote, 4);
+    if (!accepted) {
+        power_failed = true;
+        printf("adreno-power: frequency request failed; policy stopped for this boot\n");
+        return;
+    }
+    static const uint32_t khz[5] = {0,257000,345000,427000,585000};
+    core_khz = khz[wanted]; power_level = wanted; power_quiet = 0;
+    printf("adreno-power: accepted %u MHz, worked %llu us in %llu us\n",core_khz/1000,worked,ns/NSEC_PER_USEC);
 }
 
 /*
