@@ -6,6 +6,7 @@ root=Path(__file__).resolve().parents[1]
 folder=root/'build/artifacts'
 expected={'ath10k.o','kernel.macho','libOSMesa.8.dylib','loader.efi'}
 expected.update('userland/'+x for x in ['BlueTool_raphael','HakiosAudio','HakiosAudio.Info.plist','hello','child','init','var_store','libhakios.dylib','libhakios.sb.dylib','libhakios.tweaks.dylib','libhakios.app.dylib','libhakios.media.dylib','libhakios.store.dylib','libhakios.fairplay.dylib','libhakios.gl.dylib'])
+optional={'userland/libhakios.cellular-data.dylib','persistence/init.persistence'}
 records=[];seen=set()
 for p in sorted(folder.rglob('*')):
     if not p.is_file():continue
@@ -28,7 +29,9 @@ for p in sorted(folder.rglob('*')):
         kind='arm64 PE/UEFI'
     else:raise ValueError((rel,'unrecognized build product'))
     records.append(dict(path=p.relative_to(root).as_posix(),bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),format=kind))
-if args.complete:assert seen==expected,dict(missing=sorted(expected-seen),unexpected=sorted(seen-expected))
+if args.complete:
+    missing=expected-seen;unexpected=seen-expected-optional
+    assert not missing and not unexpected,dict(missing=sorted(missing),unexpected=sorted(unexpected))
 out=root/'build/reports/products.json';out.parent.mkdir(parents=True,exist_ok=True)
 out.write_text(json.dumps(dict(products=records,complete=args.complete,hardware_tested=False),indent=2)+'\n')
 print(f'Checked {len(records)} products; complete={args.complete}; compilation/format verification only.')

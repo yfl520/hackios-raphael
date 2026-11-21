@@ -6,9 +6,10 @@
 make test-host
 make test-cellular
 make test-installer
+make test-products
 ```
 
-`test-host` 覆盖蓝牙及充电策略；`test-cellular` 覆盖 QMUX、基带接口、IPA／GSI、队列和资源读取，使用模拟硬件与内存检查器；`test-installer` 覆盖 ADB、recovery 就绪等待和 IPA 链接服务。
+`test-host` 覆盖蓝牙及充电策略；`test-cellular` 覆盖 QMUX、基带接口、IPA／GSI、队列和资源读取，使用模拟硬件与内存检查器；`test-installer` 覆盖 ADB、recovery 就绪等待和 IPA 链接服务；`test-products` 检查必需／可选产物、架构、缺失文件与未知文件的拒绝行为。
 
 安装器测试中的真实 ADB／BusyBox 子测试需要自行准备工具。Windows 下可设置 `HACKIOS_TEST_ADB` 和 `HACKIOS_TEST_BUSYBOX` 后运行：
 
@@ -23,6 +24,8 @@ python -B -X utf8 -m unittest discover -s installer/tests -p 'test_*.py'
 ```bash
 make verify
 ```
+
+完整检查要求 19 项基础产物齐全。若已经构建蜂窝兼容库或持久化 init，也会检查并记录它们；未知产物仍会拒绝，不能用可选产物替代缺失的基础组件。
 
 发布源码前，在没有本地构建依赖、设备资料和生成文件的干净导出目录执行：
 

@@ -2,7 +2,7 @@ SHELL := /bin/bash
 PYTHON ?= python3
 
 .DEFAULT_GOAL := help
-.PHONY: help components deps wifi kernel mesa userland loader cellular persistence verify test test-host test-cellular test-installer audit
+.PHONY: help components deps wifi kernel mesa userland loader cellular persistence verify test test-host test-cellular test-installer test-products audit
 
 help:
 	@printf '%s\n' \
@@ -27,7 +27,7 @@ persistence:
 verify:
 	$(PYTHON) -B scripts/verify-products.py --complete
 
-test: test-host test-cellular test-installer
+test: test-host test-cellular test-installer test-products
 
 test-host:
 	bash scripts/test-host.sh
@@ -37,6 +37,9 @@ test-cellular:
 
 test-installer:
 	$(PYTHON) -B -m unittest discover -s installer/tests -p 'test_*.py'
+
+test-products:
+	$(PYTHON) -B -m unittest discover -s tests -p 'test_verify_products.py'
 
 audit:
 	$(PYTHON) -B scripts/audit-export.py

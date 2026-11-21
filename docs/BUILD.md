@@ -87,6 +87,8 @@ cp xnuloader/resource-config.example.h xnuloader/resource-config.h
 bash scripts/build-components.sh loader
 ```
 
+DeviceTree 解码需要 LZFSE。脚本可使用已安装的 `lzfse`，缺少时尝试从其 BSD 开源仓库编译；离线环境需提前从源码构建解码器并放入 `PATH` 或 `xnu-deps/host/bin/lzfse`。
+
 它用于生成 loader 的 `identity.h`，不是手机 Android 设备树。`--placeholder` 仅用于开放内核测试，不代表能够启动 iOS。
 
 ## 5. 检查构建结果
