@@ -4,6 +4,8 @@
 
 An experimental iOS 16.5 / XNU port for the Redmi K20 Pro and K20 Pro Premium Edition (SM8150 family, Adreno 640), including the kernel, drivers, boot loader, user space, and dual-boot installation tools.
 
+This project is based on [HeliumStudio-Dev/hackios-xnu-kernel](https://github.com/HeliumStudio-Dev/hackios-xnu-kernel) and extends its Redmi K20 Pro (raphael) port. Original author and upstream copyright and license notices are retained.
+
 [Documentation](docs/README.en.md) · [Device and feature support](devices/raphael/README.en.md) · [Installation](docs/getting-started/phone.en.md) · [Building](docs/BUILD.en.md)
 
 Cellular Internet, Wi-Fi, front/rear camera previews, and Bluetooth speaker playback have been tested on hardware. Calls, reliable airplane-mode recovery, and system-wide Metal remain incomplete. Application Metal is maintained separately from the default components. See the [device page](devices/raphael/README.en.md) for the full support boundaries.

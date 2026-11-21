@@ -4,6 +4,8 @@
 
 Redmi K20 Pro／K20 Pro 尊享版（SM8150 系列、Adreno 640）的 iOS 16.5／XNU 实验移植，包含内核、驱动、引导加载器、用户态和双系统安装工具。
 
+本项目基于 [HeliumStudio-Dev/hackios-xnu-kernel](https://github.com/HeliumStudio-Dev/hackios-xnu-kernel) 开发，在其 Redmi K20 Pro（raphael）移植基础上继续适配，保留原作者及上游的版权与许可声明。
+
 [文档](docs/README.md) · [设备与功能支持](devices/raphael/README.md) · [安装说明](docs/getting-started/phone.md) · [构建方法](docs/BUILD.md)
 
 蜂窝上网、Wi-Fi、双摄预览、蓝牙音箱等已有实机验证。电话、可靠飞行恢复及全系统 Metal 尚未完成；应用 Metal 和默认组件分开维护。完整功能边界见[设备页面](devices/raphael/README.md)。
